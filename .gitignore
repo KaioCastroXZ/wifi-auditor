@@ -1,0 +1,15 @@
+# dados reais de capturas/auditorias — nunca versionar (contém MACs/ESSIDs reais)
+*.cap
+*.csv
+*.netxml
+*.log
+*.bpf
+respostas.txt
+auditoria*.log
+
+# wordlist baixada em tempo de execução (grande, não precisa ir pro repo)
+wordlists/
+
+# python
+__pycache__/
+*.pyc
