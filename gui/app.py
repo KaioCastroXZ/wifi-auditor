@@ -200,6 +200,27 @@ def api_stop():
     return jsonify({"status": "parando"})
 
 
+# ----------------------------------------------------------------------
+# botão de emergência: restaurar minha rede
+# funciona em qualquer momento do fluxo, mesmo se algo travou antes
+# ----------------------------------------------------------------------
+
+def _tarefa_restaurar():
+    try:
+        engine.pedir_parada()
+        engine.restaurar_modo_gerenciado()
+        _push("restaurado", {})
+    except Exception as e:
+        _push("erro", {"mensagem": f"Falha ao restaurar a rede: {e}"})
+
+
+@app.route("/api/restore", methods=["POST"])
+def api_restore():
+    _push("log", {"linha": "Restaurando sua rede (modo gerenciado + NetworkManager)..."})
+    _em_thread(_tarefa_restaurar)
+    return jsonify({"status": "restaurando"})
+
+
 if __name__ == "__main__":
     if os.geteuid() != 0 and not os.environ.get("AUDITOR_ALLOW_NO_ROOT"):
         print("ERRO: rode este painel como root (sudo python3 app.py) — precisa")

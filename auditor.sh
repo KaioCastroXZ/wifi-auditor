@@ -193,18 +193,27 @@ detectar_interface() {
 
 entrar_modo_monitor() {
     log "Ajustando região regulatória para BR (habilita canais DFS/5GHz corretamente)..."
-    iw reg set BR &>>"$LOGFILE" || log "Aviso: não foi possível setar região regulatória."
+    timeout --kill-after=3 10s iw reg set BR &>>"$LOGFILE" || log "Aviso: não foi possível setar região regulatória."
 
     echo
     echo ">>> AVISO: a internet desta máquina vai cair agora (modo monitor)."
     echo ">>> Isso é esperado e normal. Será restaurado ao final."
+    echo ">>> Se travar ou a rede não voltar, rode: $0 --restaurar"
     echo
 
     log "Matando processos que podem interferir (NetworkManager, wpa_supplicant)..."
-    airmon-ng check kill &>>"$LOGFILE"
+    timeout --kill-after=5 20s airmon-ng check kill &>>"$LOGFILE"
+    if [[ $? -eq 124 ]]; then
+        log "Aviso: 'airmon-ng check kill' não respondeu em 20s, seguindo assim mesmo."
+    fi
 
     log "Ativando modo monitor em ${IFACE}..."
-    airmon-ng start "${IFACE}" &>>"$LOGFILE"
+    timeout --kill-after=5 20s airmon-ng start "${IFACE}" &>>"$LOGFILE"
+    if [[ $? -eq 124 ]]; then
+        erro "'airmon-ng start' travou por mais de 20s. A placa pode estar presa em modo"
+        erro "monitor de uma execução anterior. Rode: $0 --restaurar"
+        exit 1
+    fi
 
     # NÃO hardcodar "${IFACE}mon" — descobrir o nome real criado
     sleep 2
@@ -896,6 +905,27 @@ menu_principal() {
 # FLUXO PRINCIPAL
 # ============================================================================
 
+restaurar_rede_emergencia() {
+    # Botão de emergência: restaura a rede independente de qualquer estado
+    # interno (útil se uma execução anterior travou e deixou a placa em
+    # modo monitor, ou se o processo morreu sem passar pelo trap de cleanup).
+    log "=== Restauração de emergência solicitada (--restaurar) ==="
+    local qualquer_mon
+    qualquer_mon="$(iw dev | awk '/Interface/{print $2}' | grep -i 'mon' | head -n1)"
+    if [[ -n "${qualquer_mon}" ]]; then
+        log "Encontrada interface em modo monitor: ${qualquer_mon}. Parando..."
+        timeout --kill-after=5 15s airmon-ng stop "${qualquer_mon}" &>>"$LOGFILE"
+    else
+        log "Nenhuma interface em modo monitor encontrada."
+    fi
+    log "Religando NetworkManager..."
+    timeout --kill-after=5 15s systemctl restart NetworkManager &>>"$LOGFILE" \
+        || timeout --kill-after=5 15s service network-manager restart &>>"$LOGFILE"
+    sleep 2
+    log "Restauração concluída."
+    echo ">>> Rede restaurada. Se ainda não voltou, reinicie a máquina."
+}
+
 main() {
     if [[ "${EUID}" -ne 0 ]]; then
         erro "Este script precisa rodar como root (sudo ./auditor.sh)."
@@ -904,6 +934,14 @@ main() {
 
     : > "$LOGFILE"
     log "=== Iniciando auditor.sh ==="
+
+    # suporte à flag --restaurar: botão de emergência, roda e sai, sem menu
+    for arg in "$@"; do
+        if [[ "$arg" == "--restaurar" ]]; then
+            restaurar_rede_emergencia
+            exit 0
+        fi
+    done
 
     # suporte à flag --somente-dados
     for arg in "$@"; do

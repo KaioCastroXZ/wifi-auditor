@@ -179,22 +179,30 @@ class Engine:
     def entrar_modo_monitor(self, iface):
         self.iface = iface
         self.log("Ajustando região regulatória para BR...")
-        self.run(["iw", "reg", "set", "BR"])
+        self.run(["iw", "reg", "set", "BR"], timeout=10)
 
         self.log("Matando processos que podem interferir (NetworkManager, wpa_supplicant)...")
-        self.run(["airmon-ng", "check", "kill"])
+        r = self.run(["airmon-ng", "check", "kill"], timeout=20)
+        if r.returncode == 124:
+            self.log("Aviso: 'airmon-ng check kill' não respondeu em 20s, seguindo assim mesmo.")
 
         self.log(f"Ativando modo monitor em {iface}...")
-        self.run(["airmon-ng", "start", iface])
+        r = self.run(["airmon-ng", "start", iface], timeout=20)
+        if r.returncode == 124:
+            raise RuntimeError(
+                "'airmon-ng start' travou por mais de 20s. A placa pode estar presa em "
+                "modo monitor de uma execução anterior — use o botão 'Restaurar minha rede' "
+                "e tente de novo."
+            )
         time.sleep(2)
 
-        r = self.run(["iw", "dev"])
+        r = self.run(["iw", "dev"], timeout=10)
         candidatos = [i for i in re.findall(r"Interface\s+(\S+)", r.stdout) if "mon" in i.lower()]
         if candidatos:
             self.moniface = candidatos[0]
         else:
             # algumas versões não renomeiam a interface
-            info = self.run(["iw", "dev", iface, "info"])
+            info = self.run(["iw", "dev", iface, "info"], timeout=10)
             if "type monitor" in info.stdout.lower():
                 self.moniface = iface
             else:
@@ -215,11 +223,10 @@ class Engine:
             r = subprocess.run(["iw", "dev", self.moniface, "info"], capture_output=True)
             if r.returncode == 0:
                 self.log(f"Parando modo monitor em {self.moniface}...")
-                self.run(["airmon-ng", "stop", self.moniface])
-        if self.monitor_ativo:
-            self.log("Religando NetworkManager...")
-            self.run(["systemctl", "restart", "NetworkManager"])
-            time.sleep(2)
+                self.run(["airmon-ng", "stop", self.moniface], timeout=15)
+        self.log("Religando NetworkManager...")
+        self.run(["systemctl", "restart", "NetworkManager"], timeout=15)
+        time.sleep(2)
         self.monitor_ativo = False
 
     # ------------------------------------------------------------------
