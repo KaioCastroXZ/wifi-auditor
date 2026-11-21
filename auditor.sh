@@ -207,6 +207,15 @@ entrar_modo_monitor() {
         log "Aviso: 'airmon-ng check kill' não respondeu em 20s, seguindo assim mesmo."
     fi
 
+    # Snapshot ANTES de ativar o modo monitor: assim identificamos a
+    # interface pelo que MUDOU (apareceu/desapareceu), não só por conter
+    # "mon" no nome — uma interface monitor de uma execução anterior que
+    # travou (e não foi limpa por "--restaurar") também bate nesse critério
+    # e fazia o script pegar a interface errada, silenciosamente, deixando
+    # a captura vazia mais adiante (parece travado, mas é a placa errada).
+    local antes
+    antes="$(iw dev | awk '/Interface/{print $2}')"
+
     log "Ativando modo monitor em ${IFACE}..."
     timeout --kill-after=5 20s airmon-ng start "${IFACE}" &>>"$LOGFILE"
     if [[ $? -eq 124 ]]; then
@@ -217,7 +226,10 @@ entrar_modo_monitor() {
 
     # NÃO hardcodar "${IFACE}mon" — descobrir o nome real criado
     sleep 2
-    MONIFACE="$(iw dev | awk '/Interface/{print $2}' | grep -i 'mon' | head -n1)"
+    local depois novas
+    depois="$(iw dev | awk '/Interface/{print $2}')"
+    novas="$(comm -13 <(echo "${antes}" | sort) <(echo "${depois}" | sort))"
+    MONIFACE="$(echo "${novas}" | grep -i 'mon' | head -n1)"
 
     if [[ -z "${MONIFACE}" ]]; then
         # Algumas versões do airmon-ng não renomeiam a interface (mantém o nome original em modo monitor)
