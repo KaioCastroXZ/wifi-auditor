@@ -627,6 +627,14 @@ ha_cliente_conectado() {
         [[ ${#campos[@]} -ge 6 ]] || continue
         bssid_associado="$(echo "${campos[5]}" | xargs)"
         [[ "${bssid_associado,,}" == "${TARGET_BSSID,,}" ]] || continue
+        # Artefato comum do airodump: o próprio AP (frames de gerência/broadcast
+        # mal-classificados) aparece como "estação" associada a si mesmo —
+        # Station MAC == BSSID. Isso NÃO é um cliente real; sem filtrar, o
+        # script "detecta cliente" e manda deauth com -c <próprio BSSID>, que
+        # não derruba ninguém de verdade.
+        local station_mac
+        station_mac="$(echo "${campos[0]}" | xargs)"
+        [[ "${station_mac,,}" == "${TARGET_BSSID,,}" ]] && continue
         ultimo_visto="$(echo "${campos[2]}" | xargs)"
         visto_epoch="$(date -d "$ultimo_visto" +%s 2>/dev/null)" || continue
         idade=$(( agora_epoch - visto_epoch ))
@@ -646,9 +654,11 @@ cliente_do_alvo() {
     local csv
     csv="$(ls -t "${CAPTURE_PREFIX}"-[0-9]*.csv 2>/dev/null | grep -vE '\.(kismet|log)\.csv$' | head -1)"
     [[ -n "$csv" && -f "$csv" ]] || return 1
+    # Mesmo artefato de ha_cliente_conectado(): exclui o próprio BSSID
+    # aparecendo como "estação associada a si mesmo" (toupper($1)!=b).
     awk -F', *' -v b="${TARGET_BSSID}" '
         /^Station MAC/ { f=1; next }
-        f && toupper($6)==toupper(b) && $1 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/ { print $1; exit }
+        f && toupper($6)==toupper(b) && toupper($1)!=toupper(b) && $1 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/ { print $1; exit }
     ' "$csv"
 }
 
