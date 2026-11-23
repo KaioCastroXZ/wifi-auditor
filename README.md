@@ -223,9 +223,22 @@ Rota usada ........: Dicionário (aircrack-ng/rockyou)
 Log completo de toda a execução fica em `auditoria.log` (no mesmo diretório
 do script), útil para revisar depois ou debugar falhas.
 
-> O log registra os comandos executados, **incluindo a senha descoberta** ao
-> conectar (`nmcli ... password ...`). Não commite `auditoria.log` /
-> `auditoria_gui.log` em repositório público.
+> Os comandos sensíveis e mensagens de sucesso têm a senha redigida do log.
+> Ainda assim, não commite `auditoria.log`, `auditoria_gui.log`, capturas ou
+> `respostas.txt` em repositório público: esses arquivos contêm identificadores
+> da rede e o resumo pode conter a senha descoberta.
+
+## Testes simulados
+
+Os testes não usam rádio nem enviam quadros Wi-Fi. Eles exercitam parsers,
+estado, autorização, cancelamento e endpoints com fixtures locais:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Os testes de API são ignorados automaticamente quando o Flask não está
+instalado; `gui.sh` continua instalando essa dependência para executar o painel.
 
 ## Robustez / tratamento de erros
 
