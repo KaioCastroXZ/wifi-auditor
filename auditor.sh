@@ -422,6 +422,42 @@ escanear_e_escolher_alvo() {
     fi
     log "Scan concluído: fonte=airodump-ng arquivo=$(basename "$csv") aceitas=${#lista_bssid[@]} rejeitadas=${rejeitadas}."
 
+    # --- Coluna CLIENT: conta estações associadas por BSSID, direto da seção
+    # "Station MAC" do mesmo CSV do scan. Exclui o artefato de airodump em que
+    # o próprio AP aparece "associado a si mesmo" (mesmo BSSID na coluna de
+    # estação e na de AP associado) — não é um cliente real.
+    declare -A client_map
+    local em_estacoes=0 st_mac bssid_assoc
+    local -a campos_st
+    while IFS= read -r linha; do
+        if [[ "$linha" == Station\ MAC* ]]; then
+            em_estacoes=1
+            continue
+        fi
+        [[ $em_estacoes -eq 1 ]] || continue
+        IFS=',' read -ra campos_st <<< "$linha"
+        [[ ${#campos_st[@]} -ge 6 ]] || continue
+        st_mac="$(echo "${campos_st[0]}" | xargs | tr '[:lower:]' '[:upper:]')"
+        bssid_assoc="$(echo "${campos_st[5]}" | xargs | tr '[:lower:]' '[:upper:]')"
+        [[ "$bssid_assoc" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || continue
+        [[ "$st_mac" == "$bssid_assoc" ]] && continue
+        client_map["$bssid_assoc"]=$(( ${client_map["$bssid_assoc"]:-0} + 1 ))
+    done < "$csv"
+
+    # --- Coluna WPS: duas passagens curtas de "wash" (2.4GHz e 5GHz, já que
+    # ele não varre as duas bandas ao mesmo tempo) sobre os BSSIDs já
+    # encontrados. Ausência na saída == sem WPS; "Lck=No" == desbloqueado
+    # (atacável); "Lck=Yes" == bloqueado.
+    log "Verificando WPS nos APs encontrados (wash, ~16s)..."
+    declare -A wps_lck
+    local wash_out
+    wash_out="$(timeout --kill-after=3 8s wash -i "${MONIFACE}" 2>>"$LOGFILE")"$'\n'
+    wash_out+="$(timeout --kill-after=3 8s wash -i "${MONIFACE}" -5 2>>"$LOGFILE")"
+    while IFS= read -r linha; do
+        [[ "$linha" =~ ^([0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}) ]] || continue
+        wps_lck["${BASH_REMATCH[1]^^}"]="$(echo "$linha" | awk '{print $5}')"
+    done <<< "$wash_out"
+
     # Ordena índices por potência (mais perto de 0 = sinal melhor) no topo
     mapfile -t ordem < <(
         for i in "${!lista_pwr[@]}"; do
@@ -431,16 +467,26 @@ escanear_e_escolher_alvo() {
 
     echo
     echo "=============== REDES ENCONTRADAS ==============="
-    printf "%-4s %-20s %-18s %-5s %-6s %-6s\n" "Nº" "ESSID" "BSSID" "CH" "ENC" "PWR"
-    local n=1
+    printf "%-4s %-20s %-18s %-5s %-6s %-6s %-6s %-4s\n" "Nº" "ESSID" "BSSID" "CH" "ENC" "PWR" "WPS" "CLI"
+    local n=1 bssid_up lck_val wps_label cli_n
     declare -A idx_map
     for i in "${ordem[@]}"; do
-        printf "%-4s %-20s %-18s %-5s %-6s %-6s\n" \
-            "$n" "${lista_essid[$i]:0:20}" "${lista_bssid[$i]}" "${lista_ch[$i]}" "${lista_enc[$i]}" "${lista_pwr[$i]}"
+        bssid_up="${lista_bssid[$i]^^}"
+        lck_val="${wps_lck[$bssid_up]:-}"
+        case "$lck_val" in
+            "") wps_label="não" ;;
+            No|no) wps_label="SIM" ;;
+            Yes|yes) wps_label="bloq" ;;
+            *) wps_label="sim?" ;;
+        esac
+        cli_n="${client_map[$bssid_up]:-0}"
+        printf "%-4s %-20s %-18s %-5s %-6s %-6s %-6s %-4s\n" \
+            "$n" "${lista_essid[$i]:0:20}" "${lista_bssid[$i]}" "${lista_ch[$i]}" "${lista_enc[$i]}" "${lista_pwr[$i]}" "$wps_label" "$cli_n"
         idx_map[$n]=$i
         ((n++))
     done
     echo "==================================================="
+    echo "(WPS: SIM=desbloqueado/atacável, bloq=bloqueado, não=sem WPS detectado, sim?=detectado mas status incerto)"
     echo
 
     local escolha
