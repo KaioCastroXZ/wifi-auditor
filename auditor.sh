@@ -356,69 +356,43 @@ garantir_moniface_viva() {
 # 7. SCAN DE REDES (2.4 GHz + 5 GHz) E ESCOLHA DO ALVO
 # ============================================================================
 
-escanear_e_escolher_alvo() {
-    garantir_moniface_viva
-    # 25s (antes 15s): com --band abg o airodump salta ~38 canais (2.4+5GHz),
-    # dwell de ~250ms cada. Em 15s dava só ~1,5 varreduras e redes fracas (e o
-    # canal do alvo) escapavam — por isso a lista da etapa 1 vinha incompleta e
-    # divergia do que aparecia depois, já travado num canal, na captura.
-    log "Escaneando redes nas bandas a/b/g (2.4 GHz e 5 GHz) por 25s..."
+# Lê o CSV do scan NO ESTADO ATUAL (pode estar sendo escrito ainda pelo
+# airodump-ng em background) e preenche os arrays globais lista_bssid,
+# lista_ch, lista_enc, lista_pwr, lista_essid + o mapa client_map (contagem
+# de clientes por BSSID) + REJEITADAS_COUNT. Chamada repetidamente durante o
+# scan ao vivo (a cada ~2s) e mais uma vez, em definitivo, ao parar.
+_parsear_scan_csv() {
+    local csv="$1"
+    declare -ag lista_bssid=() lista_ch=() lista_enc=() lista_pwr=() lista_essid=()
+    declare -Ag client_map=()
+    declare -A bssid_visto
+    REJEITADAS_COUNT=0
 
-    rm -f "${SCAN_PREFIX}"*.csv "${SCAN_PREFIX}"*.cap "${SCAN_PREFIX}"*.kismet.* 2>/dev/null
-
-    # --kill-after força SIGKILL se o processo não morrer com SIGTERM dentro
-    # de 5s extras — sem isso, "timeout" pode ficar esperando pra sempre se
-    # o airodump-ng não terminar limpo (ex.: travado restaurando o terminal).
-    timeout --kill-after=5 25s airodump-ng --band abg --write-interval 1 \
-        --write "${SCAN_PREFIX}" --output-format csv "${MONIFACE}" &>>"$LOGFILE"
-    local scan_rc=$?
-    if [[ $scan_rc -ne 0 && $scan_rc -ne 124 && $scan_rc -ne 137 ]]; then
-        erro "O processo de scan terminou com erro (rc=${scan_rc}). Veja ${LOGFILE}."
-        exit 1
-    fi
-
-    local csv="${SCAN_PREFIX}-01.csv"
-    if [[ ! -f "$csv" ]]; then
-        erro "Arquivo de scan não foi gerado (${csv})."
-        exit 1
-    fi
+    [[ -f "$csv" ]] || return 0
 
     # O CSV do airodump tem duas seções (APs e depois Clientes), separadas por
     # linha vazia. Extraímos só a seção de APs.
-    # Colunas relevantes: BSSID, ..., channel, ..., privacy, ..., Power, ..., ESSID
+    local -a linhas_ap
     mapfile -t linhas_ap < <(awk -F', ' '
         /^Station MAC/ { exit }
         NF > 10 && $1 ~ /^[0-9A-Fa-f]{2}:/ { print }
     ' "$csv")
 
-    if [[ ${#linhas_ap[@]} -eq 0 ]]; then
-        erro "Nenhum AP encontrado no scan. Tente rodar de novo (sinal fraco?)."
-        exit 1
-    fi
-
-    # Parseia cada linha em: BSSID, Channel, Privacy, Power, ESSID
-    # "=()" é obrigatório aqui: "declare -a x" sem atribuição deixa a variável
-    # como "unset" para o bash sob `set -u` até que um índice seja atribuído.
-    # Se o scan rejeitar TODAS as linhas (0 redes aceitas), "${#lista_bssid[@]}"
-    # mais abaixo dispara "unbound variable" em vez de mostrar o erro amigável.
-    declare -a lista_bssid=() lista_ch=() lista_enc=() lista_pwr=() lista_essid=()
-    declare -A bssid_visto
-
-    local rejeitadas=0
+    local linha
+    local -a campos
     for linha in "${linhas_ap[@]}"; do
         IFS=',' read -ra campos <<< "$linha"
         # índices do formato padrão airodump CSV (0-based):
         # 0 BSSID, 3 channel, 4 speed, 5 privacy, 6 cipher, 7 auth, 8 power, 9 #beacons
-        local bssid ch privacy power essid beacons
+        local bssid ch privacy power essid idlen
         bssid="$(echo "${campos[0]}" | xargs)"
         if [[ ${#campos[@]} -lt 14 || ! "$bssid" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]]; then
-            ((rejeitadas++))
+            ((REJEITADAS_COUNT++))
             continue
         fi
         ch="$(echo "${campos[3]}" | xargs)"
         privacy="$(echo "${campos[5]}" | xargs)"
         power="$(echo "${campos[8]}" | xargs)"
-        beacons="$(echo "${campos[9]}" | xargs)"
         idlen="$(echo "${campos[12]}" | xargs)"
         # O CSV do airodump sempre termina em "..., ID-length, ESSID, Key".
         # O último campo (Key) costuma vir vazio — o ESSID é o penúltimo.
@@ -433,9 +407,7 @@ escanear_e_escolher_alvo() {
         # processado). "# beacons == 0" NÃO é confiável: em scans rápidos (dwell
         # curto por canal, muitos canais 2.4+5GHz) é comum o airodump nunca
         # "flagrar" o beacon em si de uma rede real, mas ainda captar dados/IVs e
-        # o Privacy/ESSID por outra via — descartar por beacons==0 jogava fora
-        # redes reais (ex.: TP-Link_Extender_5GHz, VIVOFIBRA-2D7C-5G com WPA2/
-        # CCMP/PSK e sinal válido, mas beacons=0 no CSV).
+        # o Privacy/ESSID por outra via.
         if [[ "$idlen" =~ ^[0-9]+$ ]] && (( idlen == 0 )); then
             continue
         fi
@@ -454,18 +426,10 @@ escanear_e_escolher_alvo() {
         lista_essid+=("${essid:-<oculto>}")
     done
 
-    if [[ ${#lista_bssid[@]} -eq 0 ]]; then
-        erro "Só apareceram entradas fantasma (0 beacons) no scan — nenhuma rede real."
-        erro "Rode de novo (sinal fraco / driver perdendo beacons ao trocar de canal)."
-        exit 1
-    fi
-    log "Scan concluído: fonte=airodump-ng arquivo=$(basename "$csv") aceitas=${#lista_bssid[@]} rejeitadas=${rejeitadas}."
-
     # --- Coluna CLIENT: conta estações associadas por BSSID, direto da seção
     # "Station MAC" do mesmo CSV do scan. Exclui o artefato de airodump em que
     # o próprio AP aparece "associado a si mesmo" (mesmo BSSID na coluna de
     # estação e na de AP associado) — não é um cliente real.
-    declare -A client_map
     local em_estacoes=0 st_mac bssid_assoc
     local -a campos_st
     while IFS= read -r linha; do
@@ -482,6 +446,112 @@ escanear_e_escolher_alvo() {
         [[ "$st_mac" == "$bssid_assoc" ]] && continue
         client_map["$bssid_assoc"]=$(( ${client_map["$bssid_assoc"]:-0} + 1 ))
     done < "$csv"
+}
+
+# Imprime a tabela de redes a partir dos arrays globais atuais (preenchidos
+# por _parsear_scan_csv) e (re)constrói idx_map global pra seleção. Com
+# "$1" == 1 mostra a coluna WPS (olhando wps_lck, global, preenchida só
+# depois de parar o scan); com 0, mostra "..." nela (ainda não verificado).
+_imprimir_tabela_redes() {
+    local com_wps="${1:-0}"
+
+    if [[ ${#lista_bssid[@]} -eq 0 ]]; then
+        echo "(nenhuma rede real encontrada ainda — aguardando beacons...)"
+        return 0
+    fi
+
+    # Ordena índices por potência (mais perto de 0 = sinal melhor) no topo
+    local -a ordem
+    mapfile -t ordem < <(
+        for i in "${!lista_pwr[@]}"; do
+            echo "${lista_pwr[$i]} $i"
+        done | sort -rn | awk '{print $2}'
+    )
+
+    printf "%-4s %-20s %-18s %-5s %-6s %-6s %-6s %-4s\n" "Nº" "ESSID" "BSSID" "CH" "ENC" "PWR" "WPS" "CLI"
+    local n=1 bssid_up lck_val wps_label cli_n
+    declare -Ag idx_map=()
+    for i in "${ordem[@]}"; do
+        bssid_up="${lista_bssid[$i]^^}"
+        if [[ "$com_wps" -eq 1 ]]; then
+            lck_val="${wps_lck[$bssid_up]:-}"
+            case "$lck_val" in
+                "") wps_label="não" ;;
+                No|no) wps_label="SIM" ;;
+                Yes|yes) wps_label="bloq" ;;
+                *) wps_label="sim?" ;;
+            esac
+        else
+            wps_label="..."
+        fi
+        cli_n="${client_map[$bssid_up]:-0}"
+        printf "%-4s %-20s %-18s %-5s %-6s %-6s %-6s %-4s\n" \
+            "$n" "${lista_essid[$i]:0:20}" "${lista_bssid[$i]}" "${lista_ch[$i]}" "${lista_enc[$i]}" "${lista_pwr[$i]}" "$wps_label" "$cli_n"
+        idx_map[$n]=$i
+        ((n++))
+    done
+}
+
+escanear_e_escolher_alvo() {
+    garantir_moniface_viva
+
+    rm -f "${SCAN_PREFIX}"*.csv "${SCAN_PREFIX}"*.cap "${SCAN_PREFIX}"*.kismet.* 2>/dev/null
+
+    log "Escaneando redes nas bandas a/b/g (2.4 GHz e 5 GHz) — ao vivo..."
+    echo
+    echo ">>> Escaneando AO VIVO. A tabela abaixo atualiza a cada ~2s conforme novas"
+    echo ">>> redes aparecem. Pressione ENTER a qualquer momento pra PARAR o scan e"
+    echo ">>> escolher o alvo com o que já foi encontrado (espere mais se uma rede"
+    echo ">>> fraca ou o alvo esperado ainda não apareceu)."
+
+    airodump-ng --band abg --write-interval 1 \
+        --write "${SCAN_PREFIX}" --output-format csv "${MONIFACE}" &>>"$LOGFILE" &
+    local scan_pid=$!
+
+    local csv="${SCAN_PREFIX}-01.csv"
+    local decorrido=0
+    local -i max_scan=300  # trava de segurança (5min) caso o usuário esqueça de apertar ENTER
+    local tecla=""
+    while (( decorrido < max_scan )); do
+        _parsear_scan_csv "$csv"
+        clear 2>/dev/null || printf '\033c'
+        echo "=============== REDES ENCONTRADAS (ao vivo, ${decorrido}s) ==============="
+        _imprimir_tabela_redes 0
+        echo "============================================================================"
+        echo "(WPS só é verificado depois de parar o scan)"
+        echo ">>> Pressione ENTER para parar o scan e escolher o alvo..."
+        if read -t 2 -r -s -n 1 tecla; then
+            break
+        fi
+        ((decorrido+=2))
+    done
+
+    # Encerra o airodump-ng em background com prazo (TERM, espera, KILL se
+    # precisar) — igual ao padrão já usado em capturar_handshake().
+    if kill -0 "$scan_pid" &>/dev/null; then
+        kill "$scan_pid" &>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            kill -0 "$scan_pid" &>/dev/null || break
+            sleep 1
+        done
+        kill -9 "$scan_pid" &>/dev/null || true
+    fi
+    wait "$scan_pid" 2>/dev/null || true
+
+    if [[ ! -f "$csv" ]]; then
+        erro "Arquivo de scan não foi gerado (${csv})."
+        exit 1
+    fi
+
+    # Parse final, definitivo, depois do airodump já ter parado de escrever.
+    _parsear_scan_csv "$csv"
+
+    if [[ ${#lista_bssid[@]} -eq 0 ]]; then
+        erro "Nenhuma rede real encontrada no scan (só fantasmas ou nada visto)."
+        erro "Rode de novo (sinal fraco / aguarde mais tempo antes de apertar ENTER)."
+        exit 1
+    fi
+    log "Scan concluído: fonte=airodump-ng arquivo=$(basename "$csv") aceitas=${#lista_bssid[@]} rejeitadas=${REJEITADAS_COUNT} tempo=${decorrido}s."
 
     # --- Coluna WPS: duas passagens curtas de "wash" (2.4GHz e 5GHz, já que
     # ele não varre as duas bandas ao mesmo tempo) sobre os BSSIDs já
@@ -489,7 +559,7 @@ escanear_e_escolher_alvo() {
     # (atacável); "Lck=Yes" == bloqueado.
     log "Verificando WPS nos APs encontrados (wash, ~16s)..."
     declare -A wps_lck
-    local wash_out
+    local wash_out linha
     wash_out="$(timeout --kill-after=3 8s wash -i "${MONIFACE}" 2>>"$LOGFILE")"$'\n'
     wash_out+="$(timeout --kill-after=3 8s wash -i "${MONIFACE}" -5 2>>"$LOGFILE")"
     while IFS= read -r linha; do
@@ -497,34 +567,10 @@ escanear_e_escolher_alvo() {
         wps_lck["${BASH_REMATCH[1]^^}"]="$(echo "$linha" | awk '{print $5}')"
     done <<< "$wash_out"
 
-    # Ordena índices por potência (mais perto de 0 = sinal melhor) no topo
-    mapfile -t ordem < <(
-        for i in "${!lista_pwr[@]}"; do
-            echo "${lista_pwr[$i]} $i"
-        done | sort -rn | awk '{print $2}'
-    )
-
     echo
-    echo "=============== REDES ENCONTRADAS ==============="
-    printf "%-4s %-20s %-18s %-5s %-6s %-6s %-6s %-4s\n" "Nº" "ESSID" "BSSID" "CH" "ENC" "PWR" "WPS" "CLI"
-    local n=1 bssid_up lck_val wps_label cli_n
-    declare -A idx_map
-    for i in "${ordem[@]}"; do
-        bssid_up="${lista_bssid[$i]^^}"
-        lck_val="${wps_lck[$bssid_up]:-}"
-        case "$lck_val" in
-            "") wps_label="não" ;;
-            No|no) wps_label="SIM" ;;
-            Yes|yes) wps_label="bloq" ;;
-            *) wps_label="sim?" ;;
-        esac
-        cli_n="${client_map[$bssid_up]:-0}"
-        printf "%-4s %-20s %-18s %-5s %-6s %-6s %-6s %-4s\n" \
-            "$n" "${lista_essid[$i]:0:20}" "${lista_bssid[$i]}" "${lista_ch[$i]}" "${lista_enc[$i]}" "${lista_pwr[$i]}" "$wps_label" "$cli_n"
-        idx_map[$n]=$i
-        ((n++))
-    done
-    echo "==================================================="
+    echo "=============== REDES ENCONTRADAS (final) ==============="
+    _imprimir_tabela_redes 1
+    echo "==========================================================="
     echo "(WPS: SIM=desbloqueado/atacável, bloq=bloqueado, não=sem WPS detectado, sim?=detectado mas status incerto)"
     echo
 
