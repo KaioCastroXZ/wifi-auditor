@@ -109,7 +109,14 @@ cleanup() {
 
     log "Limpeza concluída. Log completo em: ${LOGFILE}"
 }
-trap cleanup EXIT INT TERM
+# EXIT roda a limpeza ao final normal. INT/TERM (Ctrl+C ou kill) precisam, ALÉM
+# de limpar, ENCERRAR o processo: sem o exit, o bash voltava do trap para o loop
+# de captura e seguia tentando numa interface já derrubada pela limpeza (as
+# "Tentativas" continuavam após "Executando limpeza"). cleanup é idempotente e
+# desarma os traps, então o exit abaixo NÃO redispara a limpeza no EXIT.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # ============================================================================
 # 3. VERIFICAÇÃO DE DEPENDÊNCIAS
