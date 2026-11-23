@@ -402,8 +402,13 @@ confirmar_autorizacao() {
 # tem efeito nenhum (não há quem reconectar) — detectar isso cedo evita
 # gastar os 60s de tentativas de deauth à toa.
 ha_cliente_conectado() {
-    local csv="${CAPTURE_PREFIX}-01.csv"
-    [[ -f "$csv" ]] || return 1
+    # Lê o CSV de captura MAIS RECENTE (airodump pode gravar -01, -02, ...),
+    # excluindo os formatos auxiliares .kismet.csv e .log.csv. Antes o nome era
+    # fixo em "-01", então quando o airodump pulava para -02 a detecção lia um
+    # arquivo inexistente e nunca via o cliente associado.
+    local csv
+    csv="$(ls -t "${CAPTURE_PREFIX}"-[0-9]*.csv 2>/dev/null | grep -vE '\.(kismet|log)\.csv$' | head -1)"
+    [[ -n "$csv" && -f "$csv" ]] || return 1
     awk '/^Station MAC/{f=1} f' "$csv" | grep -qi "${TARGET_BSSID}"
 }
 
@@ -411,7 +416,11 @@ capturar_handshake() {
     garantir_moniface_viva
     log "Iniciando captura de handshake em ${TARGET_BSSID} (canal ${TARGET_CH})..."
 
-    rm -f "${CAPTURE_PREFIX}"*.cap "${CAPTURE_PREFIX}"*.csv 2>/dev/null
+    # Remove TODOS os artefatos de capturas anteriores (não só .cap/.csv, mas
+    # também .kismet.csv/.netxml e .log.csv). Se sobrar qualquer captura-NN.*,
+    # o airodump incrementa o índice (-02, -03...) e as funções que leem o
+    # resultado passam a ler o arquivo errado.
+    rm -f "${CAPTURE_PREFIX}"-* "${CAPTURE_PREFIX}".* 2>/dev/null
 
     # Captura em background, focada no BSSID e canal do alvo. Isso cobre os
     # dois casos possíveis sem o usuário precisar saber de antemão qual é o
