@@ -421,8 +421,11 @@ capturar_handshake() {
     # já um cliente que ESTAVA conectado só solta um handshake novo se for
     # forçado a reconectar — por isso o deauth só é enviado quando o script
     # detecta um cliente de fato associado ao AP.
+    # A saída de tela do airodump (tabela redesenhada N vezes por segundo com
+    # códigos ANSI) não serve como log e inflava auditoria.log em GBs; os dados
+    # úteis já vão para os arquivos ${CAPTURE_PREFIX}.* — por isso descartamos.
     airodump-ng --bssid "${TARGET_BSSID}" -c "${TARGET_CH}" --write "${CAPTURE_PREFIX}" "${MONIFACE}" \
-        &>>"$LOGFILE" &
+        &>/dev/null &
     local airodump_pid=$!
     local handshake_ok=0
 
