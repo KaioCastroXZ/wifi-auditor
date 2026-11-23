@@ -239,6 +239,18 @@ avisar_driver_fraco() {
         echo ">>> A captura passiva de handshake (quando alguém conecta) ainda costuma"
         echo ">>> funcionar. Se possível, use um adaptador com injeção confiável."
         echo
+    elif [[ "$drv" =~ ^(mt76|mt7921|mt7915|mt7996) ]]; then
+        echo
+        echo ">>> AVISO: o driver '${drv}' é MediaTek (mt76). Testado neste projeto com"
+        echo ">>> sintomas parecidos aos de placas Realtek fracas:"
+        echo ">>>   - hcxdumptool (Rota PMKID) pode falhar com 'failed to arm interface';"
+        echo ">>>   - aireplay-ng (deauth) pode falhar com 'No such BSSID available' mesmo"
+        echo ">>>     com o AP alvo visível no scan — sinal de que o canal 5GHz não está"
+        echo ">>>     travando direito na interface (confira 'iw dev ${IFACE} info' mostra"
+        echo ">>>     uma linha 'channel' durante a captura; se não mostrar, é isso)."
+        echo ">>> A captura passiva de handshake ainda costuma funcionar. Se possível,"
+        echo ">>> use um adaptador com injeção/monitor mais confiável em 5GHz."
+        echo
     fi
 }
 
@@ -246,7 +258,30 @@ avisar_driver_fraco() {
 # 6. MODO MONITOR
 # ============================================================================
 
+# Seta a região regulatória pra BR e CONFIRMA que pegou de verdade (alguns
+# drivers/firmwares — ex. mt7921e — revertem pro domínio mundial "98" se o
+# NetworkManager/wpa_supplicant ainda estiver segurando a interface quando o
+# "iw reg set" roda, ou se algo trocar o estado da interface logo depois. Sem
+# essa região aplicada de verdade, canais 5GHz como 36 podem nunca travar
+# direito (interface fica sem "channel" nenhum em "iw dev ... info"), e
+# aireplay-ng/hcxdumptool falham silenciosamente ("No such BSSID available",
+# "failed to arm interface") mesmo com o AP alvo bem visível no ar.
+_aplicar_regiao_br() {
+    timeout --kill-after=3 10s iw reg set BR &>>"$LOGFILE"
+    sleep 1
+    local dominio
+    dominio="$(iw reg get 2>/dev/null | awk '/^country/{print $2; exit}' | tr -d ':')"
+    log "Região regulatória após 'iw reg set BR': ${dominio:-desconhecida} (esperado: BR)."
+    if [[ "${dominio}" != "BR" ]]; then
+        erro "Região regulatória NÃO ficou em BR (está '${dominio:-?}'). Canais 5GHz podem"
+        erro "não travar direito (deauth/PMKID falhando sem erro claro é um sintoma disso)."
+    fi
+}
+
 entrar_modo_monitor() {
+    # Tentativa cedo (pode já ajudar o scan inicial), mas sem confiar nela —
+    # é reaplicada DEPOIS de matar NetworkManager/wpa_supplicant, que é quando
+    # costuma realmente "pegar" nesse driver.
     log "Ajustando região regulatória para BR (habilita canais DFS/5GHz corretamente)..."
     timeout --kill-after=3 10s iw reg set BR &>>"$LOGFILE" || log "Aviso: não foi possível setar região regulatória."
 
@@ -261,6 +296,10 @@ entrar_modo_monitor() {
     if [[ $? -eq 124 ]]; then
         log "Aviso: 'airmon-ng check kill' não respondeu em 20s, seguindo assim mesmo."
     fi
+
+    # Reaplica agora que NM/wpa_supplicant não estão mais segurando a
+    # interface — é aqui que a região costuma realmente ficar em BR.
+    _aplicar_regiao_br
 
     # Snapshot ANTES de ativar o modo monitor: assim identificamos a
     # interface pelo que MUDOU (apareceu/desapareceu), não só por conter
