@@ -85,6 +85,14 @@ def _iniciar_etapa_exclusiva(nome, fn, *args, **kwargs):
 # ----------------------------------------------------------------------
 
 def _cleanup_e_sair(*_a):
+    # Ctrl+C no terminal do servidor: mata TODO subprocesso vivo (airodump,
+    # hashcat, reaver...) ANTES de sair. Sem isso o os._exit orfanava os
+    # filhos, que seguiam segurando a placa em modo monitor e queimando CPU —
+    # a sensação de "dei Ctrl+C e não parou".
+    try:
+        engine.matar_tudo()
+    except Exception:
+        pass
     try:
         engine.cleanup()
     finally:

