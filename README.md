@@ -260,6 +260,49 @@ instalado; `gui.sh` continua instalando essa dependência para executar o painel
   volta ao modo gerenciado normal e o NetworkManager é religado, para você
   não perder a internet da máquina.
 
+## ⚠️ Limitações conhecidas — placas WiFi internas MediaTek (mt76/mt7921/mt7921e)
+
+Testado neste projeto numa placa interna `mt7921e` (MT7921 802.11ax PCIe).
+Mesmo depois de corrigir vários bugs reais do script (falso-positivo de
+cliente, `airmon-ng` quebrando a interface, falta da flag
+`--ignore-negative-one` no `aireplay-ng`, região regulatória reaplicada após
+matar o NetworkManager), os sintomas abaixo **persistiram de forma
+consistente e reprodutível**, o que indica limitação do driver/firmware da
+placa — não um bug corrigível no script:
+
+- **`iw reg set BR` não "pega" de verdade.** `iw reg get` continua
+  mostrando o domínio mundial (`98`/DFS-FCC) em vez de `BR`, mesmo
+  reaplicado depois de matar NetworkManager/wpa_supplicant e confirmado via
+  log. Indício de que o driver trata o wiphy como regulatório
+  "self-managed" (controlado pelo firmware, ignora hints de userspace).
+- **A interface nunca trava num canal de verdade em 5 GHz.** Durante a
+  captura (`airodump-ng -c 36`), `iw dev <iface> info` não mostra nenhuma
+  linha `channel` — sinal de que o canal não está realmente sintonizado,
+  mesmo a interface estando em modo monitor.
+- **Deauth falha sempre** com `aireplay-ng`, mesmo com `--ignore-negative-one`
+  e cliente real detectado: `Waiting for beacon frame ... on channel -1` →
+  `No such BSSID available`. Consequência direta do canal não travar.
+- **Rota PMKID (`hcxdumptool`) falha sempre** com `failed to arm interface`,
+  mesmo com a interface entregue "crua" (managed, parada) antes de chamá-lo.
+
+**O que ainda funciona bem nessa placa:** scan (ao vivo), detecção de WPS,
+detecção de cliente conectado, e **captura passiva de handshake** (esperar
+alguém conectar/reconectar naturalmente, sem depender de deauth) — o
+`airodump-ng` consegue capturar o handshake de uma conexão real mesmo sem o
+canal "travado" pela `iw`.
+
+**Solução real:** usar um adaptador WiFi **USB externo** com chipset
+conhecido por injeção/monitor confiável no Linux, em vez da placa interna:
+
+| Adaptador | Chipset | Banda | Observação |
+|---|---|---|---|
+| Alfa AWUS036NHA (ou genérico equivalente, ~AR9271) | Atheros AR9271 | só 2.4 GHz | Driver `ath9k_htc` nativo no kernel, zero configuração, injeção perfeita. Opção genérica "AR9271 for Kali Linux" no AliExpress/Mercado Livre é bem mais barata que a marca Alfa, mesmo chipset — confira que o anúncio cita "AR9271" explicitamente. |
+| Alfa AWUS036ACH | Realtek RTL8812AU | 2.4 + 5 GHz | Cobre 5 GHz (necessário se o alvo estiver nessa banda, como nos testes deste projeto). Precisa do driver `rtl8812au` via DKMS. Mais caro. |
+
+Evite adaptadores genéricos sem chipset confirmado na descrição (ex.:
+anúncios com specs fisicamente implausíveis como "2.4GHz, 1800Mbps") — sem
+saber o chipset real, não há garantia de suporte a monitor/injeção no Linux.
+
 ## Alternativa pronta (menos código pra entender, mas mais rápida)
 
 Se o objetivo for só resolver o desafio sem estudar cada etapa, o
