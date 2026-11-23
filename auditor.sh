@@ -504,8 +504,16 @@ escanear_e_escolher_alvo() {
     echo ">>> escolher o alvo com o que já foi encontrado (espere mais se uma rede"
     echo ">>> fraca ou o alvo esperado ainda não apareceu)."
 
+    # A saída de TELA do airodump (tabela redesenhada váaarias vezes por
+    # segundo com códigos ANSI) NÃO pode ir pro $LOGFILE — isso já tinha sido
+    # corrigido em capturar_handshake() mas foi reintroduzido aqui ao criar o
+    # scan ao vivo: rodando em background por dezenas de segundos, inflava o
+    # log a ponto de GB em poucos minutos e travava a máquina. Os dados úteis
+    # já vão pro CSV (--write); descartamos a tela e guardamos só stderr.
+    local scan_err="${WORKDIR}/scan_airodump.stderr.log"
+    rm -f "$scan_err"
     airodump-ng --band abg --write-interval 1 \
-        --write "${SCAN_PREFIX}" --output-format csv "${MONIFACE}" &>>"$LOGFILE" &
+        --write "${SCAN_PREFIX}" --output-format csv "${MONIFACE}" >/dev/null 2>"$scan_err" &
     local scan_pid=$!
 
     local csv="${SCAN_PREFIX}-01.csv"
@@ -513,6 +521,13 @@ escanear_e_escolher_alvo() {
     local -i max_scan=300  # trava de segurança (5min) caso o usuário esqueça de apertar ENTER
     local tecla=""
     while (( decorrido < max_scan )); do
+        if ! kill -0 "$scan_pid" &>/dev/null; then
+            wait "$scan_pid" 2>/dev/null
+            local scan_rc=$?
+            erro "O processo de scan terminou sozinho (rc=${scan_rc}). Veja ${scan_err}."
+            [[ -s "$scan_err" ]] && tail -n 20 "$scan_err" | tee -a "$LOGFILE" >&2
+            break
+        fi
         _parsear_scan_csv "$csv"
         clear 2>/dev/null || printf '\033c'
         echo "=============== REDES ENCONTRADAS (ao vivo, ${decorrido}s) ==============="
