@@ -284,12 +284,20 @@ placa — não um bug corrigível no script:
   `No such BSSID available`. Consequência direta do canal não travar.
 - **Rota PMKID (`hcxdumptool`) falha sempre** com `failed to arm interface`,
   mesmo com a interface entregue "crua" (managed, parada) antes de chamá-lo.
+- **O scan (`--band abg`) não troca de canal de verdade.** Era esperado que
+  ele pulasse entre ~38 canais (2.4+5GHz); na prática, TODAS as redes
+  encontradas aparecem no mesmo canal (ex.: 13 de 15 redes no canal 36 num
+  teste real) — estatisticamente impossível pra roteadores de vizinhos
+  diferentes. A placa fica "presa" num único canal (o último usado numa
+  captura anterior) e nunca visita os outros. **Consequência prática: uma
+  rede sua em outro canal pode simplesmente nunca aparecer na lista de
+  alvos**, mesmo com sinal forte e scan rodando por minutos — não é a rede
+  que está "invisível", é a placa que nunca olha pro canal dela.
 
-**O que ainda funciona bem nessa placa:** scan (ao vivo), detecção de WPS,
-detecção de cliente conectado, e **captura passiva de handshake** (esperar
-alguém conectar/reconectar naturalmente, sem depender de deauth) — o
-`airodump-ng` consegue capturar o handshake de uma conexão real mesmo sem o
-canal "travado" pela `iw`.
+**O que ainda funciona bem nessa placa:** detecção de WPS e de cliente
+conectado quando a rede está no canal em que a placa ficou presa, e
+**captura passiva de handshake** nesse mesmo canal (esperar alguém
+conectar/reconectar naturalmente, sem depender de deauth).
 
 **Solução real:** usar um adaptador WiFi **USB externo** com chipset
 conhecido por injeção/monitor confiável no Linux, em vez da placa interna:
