@@ -358,7 +358,11 @@ escanear_e_escolher_alvo() {
     fi
 
     # Parseia cada linha em: BSSID, Channel, Privacy, Power, ESSID
-    declare -a lista_bssid lista_ch lista_enc lista_pwr lista_essid
+    # "=()" é obrigatório aqui: "declare -a x" sem atribuição deixa a variável
+    # como "unset" para o bash sob `set -u` até que um índice seja atribuído.
+    # Se o scan rejeitar TODAS as linhas (0 redes aceitas), "${#lista_bssid[@]}"
+    # mais abaixo dispara "unbound variable" em vez de mostrar o erro amigável.
+    declare -a lista_bssid=() lista_ch=() lista_enc=() lista_pwr=() lista_essid=()
     declare -A bssid_visto
 
     local rejeitadas=0
@@ -376,6 +380,7 @@ escanear_e_escolher_alvo() {
         privacy="$(echo "${campos[5]}" | xargs)"
         power="$(echo "${campos[8]}" | xargs)"
         beacons="$(echo "${campos[9]}" | xargs)"
+        idlen="$(echo "${campos[12]}" | xargs)"
         # O CSV do airodump sempre termina em "..., ID-length, ESSID, Key".
         # O último campo (Key) costuma vir vazio — o ESSID é o penúltimo.
         # (usar $NF pegava o campo "Key" vazio, deixando tudo como <oculto>)
@@ -383,12 +388,16 @@ escanear_e_escolher_alvo() {
 
         [[ -z "$bssid" ]] && continue
 
-        # Descarta "fantasmas": o airodump cria uma linha de AP para todo BSSID
-        # que ele vê num frame de DADOS de um cliente, mesmo nunca tendo recebido
-        # um beacon dele. Esses vêm com "# beacons = 0", canal -1 e sem ESSID/
-        # privacidade — não são redes reais e eram justamente o que poluía a
-        # lista da etapa 1 (ex.: BSSIDs só "probados" por estações no scan).
-        if [[ "$beacons" =~ ^[0-9]+$ ]] && (( beacons == 0 )); then
+        # Descarta "fantasmas": BSSID visto só em frame de DADOS/probe de um
+        # cliente, sem NUNCA ter um SSID anunciado detectado — nem mesmo oculto.
+        # "ID-length == 0" é o sinal confiável disso (sem SSID == sem beacon real
+        # processado). "# beacons == 0" NÃO é confiável: em scans rápidos (dwell
+        # curto por canal, muitos canais 2.4+5GHz) é comum o airodump nunca
+        # "flagrar" o beacon em si de uma rede real, mas ainda captar dados/IVs e
+        # o Privacy/ESSID por outra via — descartar por beacons==0 jogava fora
+        # redes reais (ex.: TP-Link_Extender_5GHz, VIVOFIBRA-2D7C-5G com WPA2/
+        # CCMP/PSK e sinal válido, mas beacons=0 no CSV).
+        if [[ "$idlen" =~ ^[0-9]+$ ]] && (( idlen == 0 )); then
             continue
         fi
         # Sem canal válido não dá nem pra travar a captura depois — ignora.
