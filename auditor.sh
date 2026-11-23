@@ -504,7 +504,7 @@ escanear_e_escolher_alvo() {
     echo ">>> escolher o alvo com o que já foi encontrado (espere mais se uma rede"
     echo ">>> fraca ou o alvo esperado ainda não apareceu)."
 
-    # A saída de TELA do airodump (tabela redesenhada váaarias vezes por
+    # A saída de TELA do airodump (tabela redesenhada várias vezes por
     # segundo com códigos ANSI) NÃO pode ir pro $LOGFILE — isso já tinha sido
     # corrigido em capturar_handshake() mas foi reintroduzido aqui ao criar o
     # scan ao vivo: rodando em background por dezenas de segundos, inflava o
