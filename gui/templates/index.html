@@ -333,8 +333,13 @@
       </div>
 
       <div style="margin-top:16px">
-        <label><input type="checkbox" id="sabe-prefixo"> Eu sei parte da senha (prefixo + tamanho)</label>
+        <label><input type="checkbox" id="sabe-prefixo"> Eu sei parte da senha</label>
         <div id="mask-fields" hidden style="margin-top:8px">
+          <input type="text" id="mask-mascara" placeholder="máscara crunch (ex.: HEX%%123%%)" style="width:280px">
+          <div class="hint" style="margin:4px 0">
+            Coringas: <code>%</code>=número <code>,</code>=maiúscula <code>@</code>=minúscula <code>^</code>=símbolo; resto fica fixo.
+            Se preencher a máscara, os campos abaixo são ignorados.
+          </div>
           <input type="number" id="mask-tamanho" placeholder="tamanho total" style="width:140px">
           <input type="text" id="mask-prefixo" placeholder="prefixo conhecido" style="width:170px">
           <select id="mask-tipo">
@@ -617,11 +622,16 @@ $("#btn-attack").onclick = comCarregando($("#btn-attack"), async () => {
   const somente_dados = modo === "dados";
   let mascara = null;
   if (!somente_dados && $("#sabe-prefixo").checked) {
-    mascara = {
-      tamanho: parseInt($("#mask-tamanho").value, 10),
-      prefixo: $("#mask-prefixo").value,
-      tipo: $("#mask-tipo").value,
-    };
+    const mascaraCompleta = $("#mask-mascara").value.trim();
+    if (mascaraCompleta) {
+      mascara = { mascara: mascaraCompleta };
+    } else {
+      mascara = {
+        tamanho: parseInt($("#mask-tamanho").value, 10),
+        prefixo: $("#mask-prefixo").value,
+        tipo: $("#mask-tipo").value,
+      };
+    }
   }
   marcarEtapa(4, false);
   setStatus("atacando...", "warn");

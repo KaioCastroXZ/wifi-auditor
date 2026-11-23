@@ -408,14 +408,25 @@ class Engine:
     # 6. rotas de ataque
     # ------------------------------------------------------------------
 
-    def rota_mascara(self, tamanho, prefixo, tipo_placeholder):
-        self.log("--- Rota A: ataque de máscara (prefixo conhecido) ---")
-        restante = tamanho - len(prefixo)
-        if restante < 0:
-            self.log("Prefixo maior que o tamanho total. Abortando rota de máscara.")
-            return False
+    def rota_mascara(self, tamanho=None, prefixo="", tipo_placeholder="", mascara=None):
+        self.log("--- Rota A: ataque de máscara ---")
+        if mascara:
+            # Máscara crunch completa: parte conhecida em qualquer posição.
+            # Tamanho = nº de posições de saída (\X escapado conta como 1).
+            tamanho = len(mascara.replace("\\", ""))
+        else:
+            if tamanho is None:
+                self.log("Faltam parâmetros da máscara. Abortando rota de máscara.")
+                return False
+            restante = tamanho - len(prefixo)
+            if restante < 0:
+                self.log("Prefixo maior que o tamanho total. Abortando rota de máscara.")
+                return False
+            mascara = prefixo + (tipo_placeholder * restante)
 
-        mascara = prefixo + (tipo_placeholder * restante)
+        if tamanho < 8:
+            self.log(f"Aviso: WPA/WPA2 exige 8+ caracteres — máscara de {tamanho} dificilmente casa.")
+
         if not self.capturar_handshake():
             return False
 
@@ -435,7 +446,7 @@ class Engine:
         m = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", aircrack.stdout)
         if m:
             self.senha = m.group(1)
-            self.rota_usada = "Máscara (prefixo conhecido)"
+            self.rota_usada = "Máscara (crunch)"
             self.log(f"Senha encontrada via máscara: {self.senha}")
             return True
 
@@ -656,7 +667,13 @@ class Engine:
 
         try:
             if mascara:
-                if self.rota_mascara(mascara["tamanho"], mascara["prefixo"], mascara["tipo"]):
+                if mascara.get("mascara"):
+                    ok = self.rota_mascara(mascara=mascara["mascara"])
+                else:
+                    ok = self.rota_mascara(
+                        mascara.get("tamanho"), mascara.get("prefixo", ""), mascara.get("tipo", "")
+                    )
+                if ok:
                     return True
                 self.log("Rota de máscara não teve sucesso. Seguindo para as próximas rotas.")
 
