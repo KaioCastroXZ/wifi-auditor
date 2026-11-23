@@ -169,9 +169,12 @@ class Engine:
     # 2. interface / modo monitor
     # ------------------------------------------------------------------
 
+    def _listar_interfaces(self):
+        r = self.run(["iw", "dev"], timeout=10)
+        return re.findall(r"Interface\s+(\S+)", r.stdout)
+
     def detectar_interfaces(self):
-        r = self.run(["iw", "dev"])
-        interfaces = re.findall(r"Interface\s+(\S+)", r.stdout)
+        interfaces = self._listar_interfaces()
         if not interfaces:
             raise RuntimeError("Nenhuma interface WiFi encontrada (iw dev não listou nada).")
         return interfaces
@@ -186,6 +189,14 @@ class Engine:
         if r.returncode == 124:
             self.log("Aviso: 'airmon-ng check kill' não respondeu em 20s, seguindo assim mesmo.")
 
+        # Snapshot ANTES de ativar o modo monitor: assim identificamos a
+        # interface pelo que mudou (apareceu/desapareceu), não pelo nome
+        # conter "mon" — uma interface monitor de uma execução anterior que
+        # travou (e não foi limpa) também bate nesse critério e fazia o
+        # código pegar a interface errada (silenciosamente), gerando captura
+        # vazia / parecendo travado mais adiante, sem erro nenhum aqui.
+        antes = set(self._listar_interfaces())
+
         self.log(f"Ativando modo monitor em {iface}...")
         r = self.run(["airmon-ng", "start", iface], timeout=20)
         if r.returncode == 124:
@@ -196,17 +207,23 @@ class Engine:
             )
         time.sleep(2)
 
-        r = self.run(["iw", "dev"], timeout=10)
-        candidatos = [i for i in re.findall(r"Interface\s+(\S+)", r.stdout) if "mon" in i.lower()]
+        depois = set(self._listar_interfaces())
+        novas = sorted(depois - antes)
+        candidatos = [i for i in novas if "mon" in i.lower()]
         if candidatos:
             self.moniface = candidatos[0]
-        else:
-            # algumas versões não renomeiam a interface
+        elif iface in depois:
+            # algumas versões não renomeiam a interface, só trocam o tipo
             info = self.run(["iw", "dev", iface, "info"], timeout=10)
             if "type monitor" in info.stdout.lower():
                 self.moniface = iface
             else:
                 raise RuntimeError("Não foi possível identificar a interface em modo monitor.")
+        else:
+            raise RuntimeError(
+                f"A interface {iface} desapareceu e nenhuma interface monitor nova surgiu. "
+                "Use o botão 'Restaurar minha rede' e tente de novo."
+            )
 
         self.monitor_ativo = True
         self.log(f"Interface em modo monitor: {self.moniface}")

@@ -38,11 +38,46 @@ def _log_cb(linha):
 
 engine = Engine(_log_cb)
 
+_lock_etapas = threading.Lock()
+_etapa_ativa = {"nome": None}
+
 
 def _em_thread(fn, *args, **kwargs):
     t = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
     t.start()
     return t
+
+
+def _iniciar_etapa_exclusiva(nome, fn, *args, **kwargs):
+    """Garante que só uma etapa longa (preparar/monitor/scan/ataque) roda por
+    vez. Sem isso, o painel deixa o botão clicável de novo assim que o POST
+    volta (bem antes da etapa real terminar em background) — um segundo
+    clique dispara, por exemplo, dois 'airmon-ng start' concorrentes na
+    mesma placa, o que pode travar o kernel/driver em vez de só devolver
+    erro. Retorna False (sem iniciar nada) se já houver uma etapa rodando."""
+    with _lock_etapas:
+        if _etapa_ativa["nome"] is not None:
+            _push(
+                "erro",
+                {
+                    "mensagem": (
+                        f"Já tem uma etapa em andamento ({_etapa_ativa['nome']}). "
+                        "Aguarde terminar antes de clicar de novo."
+                    )
+                },
+            )
+            return False
+        _etapa_ativa["nome"] = nome
+
+    def _wrapper():
+        try:
+            fn(*args, **kwargs)
+        finally:
+            with _lock_etapas:
+                _etapa_ativa["nome"] = None
+
+    _em_thread(_wrapper)
+    return True
 
 
 # ----------------------------------------------------------------------
@@ -97,8 +132,8 @@ def _tarefa_preparar():
 
 @app.route("/api/prepare", methods=["POST"])
 def api_prepare():
-    _em_thread(_tarefa_preparar)
-    return jsonify({"status": "iniciado"})
+    ok = _iniciar_etapa_exclusiva("preparar", _tarefa_preparar)
+    return jsonify({"status": "iniciado" if ok else "ocupado"}), (200 if ok else 409)
 
 
 # ----------------------------------------------------------------------
@@ -116,8 +151,8 @@ def _tarefa_monitor(iface):
 @app.route("/api/monitor", methods=["POST"])
 def api_monitor():
     iface = request.json.get("iface")
-    _em_thread(_tarefa_monitor, iface)
-    return jsonify({"status": "iniciado"})
+    ok = _iniciar_etapa_exclusiva("modo monitor", _tarefa_monitor, iface)
+    return jsonify({"status": "iniciado" if ok else "ocupado"}), (200 if ok else 409)
 
 
 # ----------------------------------------------------------------------
@@ -134,8 +169,8 @@ def _tarefa_scan():
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
-    _em_thread(_tarefa_scan)
-    return jsonify({"status": "iniciado"})
+    ok = _iniciar_etapa_exclusiva("scan", _tarefa_scan)
+    return jsonify({"status": "iniciado" if ok else "ocupado"}), (200 if ok else 409)
 
 
 @app.route("/api/target", methods=["POST"])
@@ -183,8 +218,8 @@ def api_attack():
     somente_dados = bool(body.get("somente_dados"))
     mascara = body.get("mascara")  # {tamanho, prefixo, tipo} ou None
     engine._parar = False
-    _em_thread(_tarefa_ataque, mascara, somente_dados)
-    return jsonify({"status": "iniciado"})
+    ok = _iniciar_etapa_exclusiva("ataque", _tarefa_ataque, mascara, somente_dados)
+    return jsonify({"status": "iniciado" if ok else "ocupado"}), (200 if ok else 409)
 
 
 @app.route("/api/stop", methods=["POST"])
