@@ -11,6 +11,7 @@ nmcli, etc. mexem direto na placa de rede.
 """
 
 import atexit
+import fcntl
 import json
 import os
 import queue
@@ -25,11 +26,25 @@ from core import Engine  # noqa: E402
 
 app = Flask(__name__)
 
-_log_queue: "queue.Queue[str]" = queue.Queue()
+_subscribers = set()
+_subscribers_lock = threading.Lock()
+_global_lock_handle = None
+LOCK_PATH = "/run/lock/wifi-auditor.lock"
 
 
 def _push(tipo, dados=None):
-    _log_queue.put(json.dumps({"tipo": tipo, "dados": dados or {}}))
+    mensagem = json.dumps({"tipo": tipo, "dados": dados or {}})
+    with _subscribers_lock:
+        filas = list(_subscribers)
+    for fila in filas:
+        try:
+            fila.put_nowait(mensagem)
+        except queue.Full:
+            try:
+                fila.get_nowait()
+                fila.put_nowait(mensagem)
+            except queue.Empty:
+                pass
 
 
 def _log_cb(linha):
@@ -39,7 +54,7 @@ def _log_cb(linha):
 engine = Engine(_log_cb)
 
 _lock_etapas = threading.Lock()
-_etapa_ativa = {"nome": None}
+_etapa_ativa = {"nome": None, "thread": None, "recuperando": False}
 
 
 def _em_thread(fn, *args, **kwargs):
@@ -56,28 +71,119 @@ def _iniciar_etapa_exclusiva(nome, fn, *args, **kwargs):
     mesma placa, o que pode travar o kernel/driver em vez de só devolver
     erro. Retorna False (sem iniciar nada) se já houver uma etapa rodando."""
     with _lock_etapas:
-        if _etapa_ativa["nome"] is not None:
+        if _etapa_ativa["nome"] is not None or _etapa_ativa["recuperando"]:
+            atual = _etapa_ativa["nome"] or "restauração"
             _push(
                 "erro",
                 {
                     "mensagem": (
-                        f"Já tem uma etapa em andamento ({_etapa_ativa['nome']}). "
+                        f"Já tem uma etapa em andamento ({atual}). "
                         "Aguarde terminar antes de clicar de novo."
                     )
                 },
             )
             return False
-        _etapa_ativa["nome"] = nome
+        def _wrapper():
+            engine.iniciar_operacao()
+            thread_atual = threading.current_thread()
+            try:
+                fn(*args, **kwargs)
+            finally:
+                with _lock_etapas:
+                    if _etapa_ativa["thread"] is thread_atual:
+                        _etapa_ativa["nome"] = None
+                        _etapa_ativa["thread"] = None
 
-    def _wrapper():
+        t = threading.Thread(target=_wrapper, daemon=True, name=f"auditor-{nome}")
+        _etapa_ativa["nome"] = nome
+        _etapa_ativa["thread"] = t
+
+    try:
+        t.start()
+    except Exception:
+        with _lock_etapas:
+            _etapa_ativa["nome"] = None
+            _etapa_ativa["thread"] = None
+        raise
+    return True
+
+
+def _rejeitar_se_ocupado():
+    with _lock_etapas:
+        nome = _etapa_ativa["nome"]
+        recuperando = _etapa_ativa["recuperando"]
+    if nome or recuperando:
+        return jsonify({"erro": f"Operação em andamento: {nome or 'restauração'}"}), 409
+    return None
+
+
+def _iniciar_recuperacao(forcar):
+    with _lock_etapas:
+        if _etapa_ativa["recuperando"]:
+            return False
+        _etapa_ativa["recuperando"] = True
+        thread_ativa = _etapa_ativa["thread"]
+
+    def _recuperar():
         try:
-            fn(*args, **kwargs)
+            engine.pedir_parada()
+            if thread_ativa and thread_ativa is not threading.current_thread():
+                thread_ativa.join(timeout=40)
+                if thread_ativa.is_alive():
+                    _push("erro", {"mensagem": "A etapa não encerrou dentro do prazo de segurança."})
+            if forcar:
+                engine.restaurar_modo_gerenciado(forcar=True)
+            else:
+                engine.cleanup()
+            _push("restaurado" if forcar else "parado", {})
+        except Exception as e:
+            _push("erro", {"mensagem": f"Falha ao restaurar a rede: {e}"})
         finally:
             with _lock_etapas:
-                _etapa_ativa["nome"] = None
+                _etapa_ativa["recuperando"] = False
 
-    _em_thread(_wrapper)
+    _em_thread(_recuperar)
     return True
+
+
+def _adquirir_lock_global():
+    global _global_lock_handle
+    _global_lock_handle = open(LOCK_PATH, "a+")
+    try:
+        fcntl.flock(_global_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as e:
+        raise RuntimeError("Outra instância do WiFi Auditor já está usando a interface.") from e
+    _global_lock_handle.seek(0)
+    _global_lock_handle.truncate()
+    _global_lock_handle.write(str(os.getpid()))
+    _global_lock_handle.flush()
+
+
+def _validar_mascara(mascara):
+    if mascara is None:
+        return None
+    if not isinstance(mascara, dict):
+        return "Máscara inválida."
+    if mascara.get("hashcat"):
+        if not isinstance(mascara["hashcat"], str) or len(mascara["hashcat"]) > 256:
+            return "Máscara hashcat inválida."
+        if not isinstance(mascara.get("custom", ""), str):
+            return "Charset custom inválido."
+        return None
+    if mascara.get("mascara"):
+        if not isinstance(mascara["mascara"], str) or len(mascara["mascara"]) > 256:
+            return "Máscara crunch inválida."
+        return None
+    tamanho = mascara.get("tamanho")
+    prefixo = mascara.get("prefixo", "")
+    tipo = mascara.get("tipo", "")
+    if isinstance(tamanho, bool) or not isinstance(tamanho, int) or not 1 <= tamanho <= 63:
+        return "Tamanho da máscara deve estar entre 1 e 63."
+    if not isinstance(prefixo, str) or len(prefixo) > tamanho:
+        return "Prefixo da máscara inválido."
+    if tipo not in ("%", ",", "@", "^"):
+        return "Tipo de coringa inválido."
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -85,23 +191,16 @@ def _iniciar_etapa_exclusiva(nome, fn, *args, **kwargs):
 # ----------------------------------------------------------------------
 
 def _cleanup_e_sair(*_a):
-    # Ctrl+C no terminal do servidor: mata TODO subprocesso vivo (airodump,
-    # hashcat, reaver...) ANTES de sair. Sem isso o os._exit orfanava os
-    # filhos, que seguiam segurando a placa em modo monitor e queimando CPU —
-    # a sensação de "dei Ctrl+C e não parou".
-    try:
-        engine.matar_tudo()
-    except Exception:
-        pass
     try:
         engine.cleanup()
     finally:
         os._exit(0)
 
 
-signal.signal(signal.SIGINT, _cleanup_e_sair)
-signal.signal(signal.SIGTERM, _cleanup_e_sair)
-atexit.register(engine.cleanup)
+def _registrar_cleanup_de_processo():
+    signal.signal(signal.SIGINT, _cleanup_e_sair)
+    signal.signal(signal.SIGTERM, _cleanup_e_sair)
+    atexit.register(engine.cleanup)
 
 
 # ----------------------------------------------------------------------
@@ -115,11 +214,22 @@ def index():
 
 @app.route("/api/stream")
 def stream():
+    fila = queue.Queue(maxsize=500)
+    with _subscribers_lock:
+        _subscribers.add(fila)
+
     def gerar():
-        yield "retry: 2000\n\n"
-        while True:
-            linha = _log_queue.get()
-            yield f"data: {linha}\n\n"
+        try:
+            yield "retry: 2000\n\n"
+            while True:
+                try:
+                    linha = fila.get(timeout=15)
+                    yield f"data: {linha}\n\n"
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            with _subscribers_lock:
+                _subscribers.discard(fila)
 
     return Response(gerar(), mimetype="text/event-stream")
 
@@ -154,11 +264,15 @@ def _tarefa_monitor(iface):
         _push("monitor_pronto", {"moniface": moniface})
     except Exception as e:
         _push("erro", {"mensagem": str(e)})
+        engine.cleanup()
 
 
 @app.route("/api/monitor", methods=["POST"])
 def api_monitor():
-    iface = request.json.get("iface")
+    body = request.get_json(silent=True) or {}
+    iface = body.get("iface")
+    if not isinstance(iface, str) or not iface:
+        return jsonify({"erro": "Interface inválida."}), 400
     ok = _iniciar_etapa_exclusiva("modo monitor", _tarefa_monitor, iface)
     return jsonify({"status": "iniciado" if ok else "ocupado"}), (200 if ok else 409)
 
@@ -183,8 +297,17 @@ def api_scan():
 
 @app.route("/api/target", methods=["POST"])
 def api_target():
-    idx = int(request.json.get("idx"))
-    alvo = engine.escolher_alvo(idx)
+    ocupado = _rejeitar_se_ocupado()
+    if ocupado:
+        return ocupado
+    body = request.get_json(silent=True) or {}
+    idx = body.get("idx")
+    if isinstance(idx, bool) or not isinstance(idx, int):
+        return jsonify({"erro": "Índice de alvo inválido."}), 400
+    try:
+        alvo = engine.escolher_alvo(idx)
+    except (IndexError, ValueError) as e:
+        return jsonify({"erro": str(e)}), 400
     _push("alvo_escolhido", {"alvo": alvo})
     return jsonify({"status": "ok", "alvo": alvo})
 
@@ -195,8 +318,17 @@ def api_target():
 
 @app.route("/api/authorize", methods=["POST"])
 def api_authorize():
-    confirmado = bool(request.json.get("confirmado"))
-    ok = engine.autorizar(confirmado)
+    ocupado = _rejeitar_se_ocupado()
+    if ocupado:
+        return ocupado
+    body = request.get_json(silent=True) or {}
+    confirmado = body.get("confirmado")
+    if type(confirmado) is not bool:
+        return jsonify({"erro": "O campo confirmado deve ser booleano."}), 400
+    try:
+        ok = engine.autorizar(confirmado)
+    except RuntimeError as e:
+        return jsonify({"erro": str(e)}), 409
     _push("autorizado", {"ok": ok})
     return jsonify({"status": "ok", "autorizado": ok})
 
@@ -207,8 +339,11 @@ def api_authorize():
 
 def _tarefa_ataque(mascara, somente_dados):
     try:
+        engine.iniciar_tentativa()
         if not somente_dados:
             engine.executar_ataque(mascara=mascara)
+            if engine._parar:
+                return
             if engine.senha:
                 engine.conectar_e_obter_gateway()
         resumo = engine.resumo()
@@ -222,24 +357,27 @@ def _tarefa_ataque(mascara, somente_dados):
 
 @app.route("/api/attack", methods=["POST"])
 def api_attack():
-    body = request.json or {}
-    somente_dados = bool(body.get("somente_dados"))
+    body = request.get_json(silent=True) or {}
+    somente_dados = body.get("somente_dados", False)
+    if type(somente_dados) is not bool:
+        return jsonify({"erro": "somente_dados deve ser booleano."}), 400
     mascara = body.get("mascara")  # {tamanho, prefixo, tipo} ou None
-    engine._parar = False
+    erro_mascara = _validar_mascara(mascara)
+    if erro_mascara:
+        return jsonify({"erro": erro_mascara}), 400
+    if not engine.target.get("bssid"):
+        return jsonify({"erro": "Selecione um alvo antes de iniciar."}), 409
+    if not engine.autorizacao_valida():
+        return jsonify({"erro": "Autorize explicitamente o BSSID selecionado."}), 409
     ok = _iniciar_etapa_exclusiva("ataque", _tarefa_ataque, mascara, somente_dados)
     return jsonify({"status": "iniciado" if ok else "ocupado"}), (200 if ok else 409)
 
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    engine.pedir_parada()
     _push("log", {"linha": "Parada de emergência solicitada pelo painel..."})
-
-    def _parar_e_limpar():
-        engine.cleanup()
-        _push("parado", {})
-
-    _em_thread(_parar_e_limpar)
+    if not _iniciar_recuperacao(forcar=False):
+        return jsonify({"status": "já parando"}), 409
     return jsonify({"status": "parando"})
 
 
@@ -248,19 +386,11 @@ def api_stop():
 # funciona em qualquer momento do fluxo, mesmo se algo travou antes
 # ----------------------------------------------------------------------
 
-def _tarefa_restaurar():
-    try:
-        engine.pedir_parada()
-        engine.restaurar_modo_gerenciado()
-        _push("restaurado", {})
-    except Exception as e:
-        _push("erro", {"mensagem": f"Falha ao restaurar a rede: {e}"})
-
-
 @app.route("/api/restore", methods=["POST"])
 def api_restore():
     _push("log", {"linha": "Restaurando sua rede (modo gerenciado + NetworkManager)..."})
-    _em_thread(_tarefa_restaurar)
+    if not _iniciar_recuperacao(forcar=True):
+        return jsonify({"status": "já restaurando"}), 409
     return jsonify({"status": "restaurando"})
 
 
@@ -270,5 +400,12 @@ if __name__ == "__main__":
         print("mexer direto na placa de rede (airmon-ng, airodump-ng, nmcli, etc.).")
         sys.exit(1)
 
+    try:
+        _adquirir_lock_global()
+    except RuntimeError as e:
+        print(f"ERRO: {e}")
+        sys.exit(1)
+
+    _registrar_cleanup_de_processo()
     print("Painel disponível em: http://127.0.0.1:5000")
     app.run(host="127.0.0.1", port=5000, threaded=True)
