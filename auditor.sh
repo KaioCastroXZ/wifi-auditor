@@ -1251,8 +1251,22 @@ rota_pmkid() {
     # capturados sempre, silenciosamente. Por isso saímos do modo monitor,
     # deixamos o hcxdumptool cuidar disso sozinho, e recriamos o modo
     # monitor depois pra seguir com as próximas rotas.
-    log "Saindo do modo monitor do airmon-ng (hcxdumptool precisa da interface física crua)..."
-    airmon-ng stop "${MONIFACE}" &>>"$LOGFILE"
+    #
+    # Em drivers mac80211 modernos (ex.: mt7921e) o monitor é ativado DIRETO
+    # na interface física — MONIFACE == IFACE, sem "wlanXmon" separada. Nesse
+    # caso "airmon-ng stop" fica confuso (não reconhece o próprio padrão de
+    # nome) e devolve a interface num estado quebrado ("NOT in station mode"),
+    # fazendo o hcxdumptool falhar com "failed to arm interface" a seguir.
+    # Evitamos isso trocando o tipo da interface direto via iw/ip quando
+    # MONIFACE == IFACE, sem passar pelo airmon-ng nesse trecho específico.
+    log "Saindo do modo monitor (hcxdumptool precisa da interface física crua)..."
+    if [[ "${MONIFACE}" == "${IFACE}" ]]; then
+        ip link set "${IFACE}" down &>>"$LOGFILE"
+        iw dev "${IFACE}" set type managed &>>"$LOGFILE"
+        ip link set "${IFACE}" up &>>"$LOGFILE"
+    else
+        airmon-ng stop "${MONIFACE}" &>>"$LOGFILE"
+    fi
     sleep 1
 
     # -w (não -o) é o flag de saída no hcxdumptool >= 6.3.0 / 7.x (Ubuntu/Kali atuais).
@@ -1260,13 +1274,26 @@ rota_pmkid() {
     timeout --kill-after=5 30s hcxdumptool -i "${IFACE}" -w "$pmkid_cap" \
         --bpf="$bpf_file" -c "${freq_mhz}" &>>"$LOGFILE"
 
-    # Sempre volta pro modo monitor via airmon-ng, mesmo se a rota falhar —
-    # as próximas rotas (dicionário) dependem disso.
-    log "Recriando modo monitor via airmon-ng para seguir com as próximas rotas..."
-    airmon-ng start "${IFACE}" &>>"$LOGFILE"
-    sleep 2
-    MONIFACE="$(iw dev | awk '/Interface/{print $2}' | grep -i 'mon' | head -n1)"
-    [[ -z "${MONIFACE}" ]] && MONIFACE="${IFACE}"
+    # Sempre volta pro modo monitor, mesmo se a rota falhar — as próximas
+    # rotas (dicionário) dependem disso. Mesma lógica: se a interface física
+    # e a de monitor eram a mesma, volta direto via iw/ip em vez de
+    # "airmon-ng start" (que reproduziria o mesmo estado quebrado).
+    log "Recriando modo monitor para seguir com as próximas rotas..."
+    if [[ "${MONIFACE}" == "${IFACE}" ]]; then
+        ip link set "${IFACE}" down &>>"$LOGFILE"
+        iw dev "${IFACE}" set type monitor &>>"$LOGFILE"
+        ip link set "${IFACE}" up &>>"$LOGFILE"
+        sleep 1
+        MONIFACE="${IFACE}"
+    else
+        airmon-ng start "${IFACE}" &>>"$LOGFILE"
+        sleep 2
+        MONIFACE="$(iw dev | awk '/Interface/{print $2}' | grep -i 'mon' | head -n1)"
+        [[ -z "${MONIFACE}" ]] && MONIFACE="${IFACE}"
+    fi
+    if ! iw dev "${MONIFACE}" info 2>/dev/null | grep -qi "type monitor"; then
+        erro "Não foi possível recriar o modo monitor em ${MONIFACE} após a tentativa de PMKID."
+    fi
     log "Interface em modo monitor novamente: ${MONIFACE}"
 
     if [[ ! -s "$pmkid_cap" ]]; then
