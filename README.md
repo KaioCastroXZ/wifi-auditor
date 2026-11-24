@@ -283,7 +283,20 @@ placa — não um bug corrigível no script:
   e cliente real detectado: `Waiting for beacon frame ... on channel -1` →
   `No such BSSID available`. Consequência direta do canal não travar.
 - **Rota PMKID (`hcxdumptool`) falha sempre** com `failed to arm interface`,
-  mesmo com a interface entregue "crua" (managed, parada) antes de chamá-lo.
+  mesmo com a interface entregue "crua" (managed, parada) antes de chamá-lo
+  — confirmado como limitação real de driver/firmware (não bug corrigível),
+  inclusive documentada em relatos de usuários e no próprio projeto do
+  `hcxdumptool`, que já precisou de contorno específico pra chips `mt76`.
+
+  **✅ Script agora PULA essa rota de propósito** nesses drivers, em vez de
+  só deixá-la falhar: tentar mesmo assim causava um dano colateral real —
+  pra soltar a interface pro `hcxdumptool`, a rota precisa parar e recriar
+  o modo monitor (`airmon-ng stop`/`start`), e a recriação às vezes volta
+  SEM uma interface de monitor separada (monitor direto na física), que é
+  o mesmo estado que trava o canal — quebrando a captura de handshake das
+  rotas seguintes mesmo depois do reload do driver ter deixado tudo bem no
+  início da execução. Como a rota nunca teve sucesso, pular ela de
+  propósito (antes de tocar na interface) protege as rotas que funcionam.
 - **O scan (`--band abg`) não trocava de canal de verdade.** Era esperado
   que ele pulasse entre ~38 canais (2.4+5GHz); na prática, TODAS as redes
   encontradas apareciam no mesmo canal (ex.: 13 de 15 redes no canal 36 num
