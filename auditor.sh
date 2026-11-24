@@ -77,6 +77,16 @@ pausar_enter() {
     read -rp "Pressione ENTER para continuar..." _
 }
 
+_tela_etapa() {
+    # Limpa o terminal entre etapas pra não acumular tabelas/saídas antigas
+    # na tela. O log completo continua tudo em $LOGFILE, isso é só exibição.
+    clear
+    echo "=================================================================="
+    echo " ${1}"
+    [[ -n "${TARGET_ESSID:-}" ]] && echo " Alvo: ${TARGET_ESSID} (${TARGET_BSSID})"
+    echo "=================================================================="
+}
+
 confirmar() {
     # Pergunta sim/no; só aceita "sim" explicitamente (case-insensitive)
     local pergunta="$1"
@@ -757,7 +767,7 @@ avisar_limitacoes_cripto() {
 # ============================================================================
 
 confirmar_autorizacao() {
-    echo
+    clear
     echo "=================================================================="
     echo " Você está sobre o ponto de executar uma auditoria/ataque WiFi    "
     echo " contra o AP:                                                     "
@@ -996,8 +1006,7 @@ ultimo_cap() {
 # ============================================================================
 
 rota_mascara() {
-    echo
-    echo "--- Rota A: ataque de máscara ---"
+    _tela_etapa "Rota A: ataque de máscara"
     local tamanho prefixo tipo_restante placeholder mascara modo restante i
 
     echo "Como montar a máscara?"
@@ -1201,8 +1210,7 @@ quebrar_hc22000_com_mascara() {
 # ============================================================================
 
 rota_wps() {
-    echo
-    echo "--- Rota B: WPS ---"
+    _tela_etapa "Rota B: WPS"
     garantir_moniface_viva
     log "Verificando se o AP possui WPS ativo (wash)..."
 
@@ -1295,8 +1303,7 @@ rota_wps() {
 # ============================================================================
 
 rota_dicionario() {
-    echo
-    echo "--- Rota C: dicionário + regras (hashcat / aircrack-ng) ---"
+    _tela_etapa "Rota C: dicionário + regras (hashcat / aircrack-ng)"
 
     if ! capturar_handshake; then
         return 1
@@ -1392,8 +1399,7 @@ rota_dicionario() {
 # tentativa — não substitui as outras rotas.
 
 rota_pmkid() {
-    echo
-    echo "--- Rota D: PMKID (ataque direto ao roteador, sem precisar de cliente) ---"
+    _tela_etapa "Rota D: PMKID (ataque direto ao roteador, sem precisar de cliente)"
 
     # Drivers MediaTek mt76/mt7921/mt7915/mt7996 NUNCA conseguem rodar PMKID
     # de verdade (hcxdumptool sempre falha com "failed to arm interface" —
