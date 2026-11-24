@@ -1185,7 +1185,11 @@ rota_mascara_hashcat() {
     fi
 
     if [[ -s "$found" ]]; then
-        SENHA_ENCONTRADA="$(cut -d':' -f2- "$found" | tail -1)"
+        # O arquivo de saída do hashcat (-o) pra modo 22000 vem como
+        # MAC_AP:MAC_STA:ESSID:senha — "cut -f2-" pegava tudo a partir do 2º
+        # campo (MAC_STA:ESSID:senha junto), não só a senha. "awk '{print
+        # $NF}'" pega sempre o ÚLTIMO campo, não importa quantos : vierem antes.
+        SENHA_ENCONTRADA="$(tail -1 "$found" | awk -F: '{print $NF}')"
         ROTA_USADA="Máscara (hashcat -a 3)"
         log "Senha encontrada via máscara hashcat (valor redigido do log)."
         return 0
@@ -1228,7 +1232,7 @@ quebrar_hc22000_com_mascara() {
     cat "$hc_out" >> "$LOGFILE"
 
     if [[ -s "$found" ]]; then
-        cut -d':' -f2- "$found" | tail -1
+        tail -1 "$found" | awk -F: '{print $NF}'
         return 0
     fi
     return 1
@@ -1360,7 +1364,7 @@ rota_dicionario() {
             --potfile-disable -o "${WORKDIR}/hashcat_found.txt" &>>"$LOGFILE"
 
         if [[ -s "${WORKDIR}/hashcat_found.txt" ]]; then
-            SENHA_ENCONTRADA="$(cut -d':' -f2- "${WORKDIR}/hashcat_found.txt" | tail -1)"
+            SENHA_ENCONTRADA="$(tail -1 "${WORKDIR}/hashcat_found.txt" | awk -F: '{print $NF}')"
             ROTA_USADA="Dicionário (hashcat + best64)"
             log "Senha encontrada via hashcat (valor redigido do log)."
             return 0
@@ -1390,7 +1394,7 @@ rota_dicionario() {
             hashcat -m 22000 "$hashfile" "$wl" -r /usr/share/hashcat/rules/best64.rule \
                 --potfile-disable -o "${WORKDIR}/hashcat_found.txt" &>>"$LOGFILE"
             if [[ -s "${WORKDIR}/hashcat_found.txt" ]]; then
-                SENHA_ENCONTRADA="$(cut -d':' -f2- "${WORKDIR}/hashcat_found.txt" | tail -1)"
+                SENHA_ENCONTRADA="$(tail -1 "${WORKDIR}/hashcat_found.txt" | awk -F: '{print $NF}')"
                 ROTA_USADA="Dicionário ($(basename "$wl") + best64)"
                 log "Senha encontrada via hashcat/wordlist extra (valor redigido do log)."
                 return 0
@@ -1594,7 +1598,7 @@ rota_pmkid() {
         --potfile-disable -o "${WORKDIR}/pmkid_found.txt" &>>"$LOGFILE"
 
     if [[ -s "${WORKDIR}/pmkid_found.txt" ]]; then
-        SENHA_ENCONTRADA="$(cut -d':' -f2- "${WORKDIR}/pmkid_found.txt" | tail -1)"
+        SENHA_ENCONTRADA="$(tail -1 "${WORKDIR}/pmkid_found.txt" | awk -F: '{print $NF}')"
         ROTA_USADA="PMKID (hcxdumptool + hashcat)"
         log "Senha encontrada via PMKID (valor redigido do log)."
         return 0
