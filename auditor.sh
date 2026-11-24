@@ -1394,6 +1394,27 @@ rota_dicionario() {
 rota_pmkid() {
     echo
     echo "--- Rota D: PMKID (ataque direto ao roteador, sem precisar de cliente) ---"
+
+    # Drivers MediaTek mt76/mt7921/mt7915/mt7996 NUNCA conseguem rodar PMKID
+    # de verdade (hcxdumptool sempre falha com "failed to arm interface" —
+    # limitação confirmada do driver/firmware, não do script). PIOR: tentar
+    # mesmo assim exige soltar e recriar o modo monitor (stop/start via
+    # airmon-ng) pro hcxdumptool usar a interface crua — e essa recriação às
+    # vezes volta num estado SEM interface de monitor separada (direto na
+    # interface física), que é o mesmo estado que já vimos travar o canal e
+    # quebrar a captura de handshake das rotas seguintes. Como essa rota
+    # nunca vai funcionar aqui mesmo, pular ela de propósito PROTEGE as
+    # rotas seguintes de serem quebradas à toa por uma tentativa fadada ao
+    # fracasso.
+    local drv=""
+    drv="$(basename "$(readlink -f "/sys/class/net/${IFACE}/device/driver" 2>/dev/null)" 2>/dev/null)"
+    if [[ "$drv" =~ ^(mt76|mt7921|mt7915|mt7996) ]]; then
+        log "Driver ${drv} (MediaTek mt76) — PMKID é conhecido por não funcionar nessa"
+        log "família de driver (hcxdumptool falha ao 'armar' a interface) e tentar mesmo"
+        log "assim arriscaria quebrar o modo monitor pras próximas rotas. Pulando Rota PMKID."
+        return 1
+    fi
+
     garantir_moniface_viva
 
     if ! command -v hcxdumptool &>/dev/null; then
