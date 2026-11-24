@@ -278,6 +278,34 @@ _aplicar_regiao_br() {
     fi
 }
 
+# Recarrega o módulo do driver da placa, limpando qualquer estado "preso"
+# de canal/firmware de uma execução anterior. CONFIRMADO na prática: sem
+# isso, o scan (--band abg) ficava preso rodando SEMPRE no mesmo canal (ex.:
+# 13 de 15 redes detectadas no canal 36 num teste real — estatisticamente
+# impossível pra roteadores de vizinhos diferentes), e deauth/PMKID falhavam
+# com erros de canal -1. Recarregar o módulo (rmmod + modprobe) resolveu na
+# prática. Só mexe em drivers MediaTek mt76/mt7921/mt7915/mt7996, onde esse
+# problema foi observado e confirmado — outros drivers não são tocados.
+_recarregar_driver_se_necessario() {
+    local drv=""
+    drv="$(basename "$(readlink -f "/sys/class/net/${IFACE}/device/driver" 2>/dev/null)" 2>/dev/null)"
+    [[ "$drv" =~ ^(mt76|mt7921|mt7915|mt7996) ]] || return 0
+
+    log "Driver ${drv} (MediaTek mt76) detectado — recarregando módulo pra evitar canal preso de execução anterior..."
+    if ! timeout --kill-after=3 10s rmmod "$drv" &>>"$LOGFILE"; then
+        log "Aviso: não consegui descarregar o módulo ${drv} (pode estar em uso) — seguindo sem recarregar."
+        return 0
+    fi
+    sleep 2
+    if ! timeout --kill-after=5 15s modprobe "$drv" &>>"$LOGFILE"; then
+        erro "Falha ao recarregar o módulo ${drv} depois de descarregá-lo! A placa pode ter sumido."
+        erro "Rode manualmente: sudo modprobe ${drv}"
+        return 1
+    fi
+    sleep 3
+    log "Módulo ${drv} recarregado."
+}
+
 entrar_modo_monitor() {
     # Tentativa cedo (pode já ajudar o scan inicial), mas sem confiar nela —
     # é reaplicada DEPOIS de matar NetworkManager/wpa_supplicant, que é quando
@@ -296,6 +324,11 @@ entrar_modo_monitor() {
     if [[ $? -eq 124 ]]; then
         log "Aviso: 'airmon-ng check kill' não respondeu em 20s, seguindo assim mesmo."
     fi
+
+    # Recarrega o driver ANTES de ativar o modo monitor (precisa da
+    # interface livre, sem NM/wpa_supplicant segurando ela) — ver comentário
+    # da função pra detalhes do porquê isso é necessário.
+    _recarregar_driver_se_necessario
 
     # Reaplica agora que NM/wpa_supplicant não estão mais segurando a
     # interface — é aqui que a região costuma realmente ficar em BR.

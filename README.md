@@ -284,20 +284,26 @@ placa — não um bug corrigível no script:
   `No such BSSID available`. Consequência direta do canal não travar.
 - **Rota PMKID (`hcxdumptool`) falha sempre** com `failed to arm interface`,
   mesmo com a interface entregue "crua" (managed, parada) antes de chamá-lo.
-- **O scan (`--band abg`) não troca de canal de verdade.** Era esperado que
-  ele pulasse entre ~38 canais (2.4+5GHz); na prática, TODAS as redes
-  encontradas aparecem no mesmo canal (ex.: 13 de 15 redes no canal 36 num
+- **O scan (`--band abg`) não trocava de canal de verdade.** Era esperado
+  que ele pulasse entre ~38 canais (2.4+5GHz); na prática, TODAS as redes
+  encontradas apareciam no mesmo canal (ex.: 13 de 15 redes no canal 36 num
   teste real) — estatisticamente impossível pra roteadores de vizinhos
-  diferentes. A placa fica "presa" num único canal (o último usado numa
-  captura anterior) e nunca visita os outros. **Consequência prática: uma
-  rede sua em outro canal pode simplesmente nunca aparecer na lista de
-  alvos**, mesmo com sinal forte e scan rodando por minutos — não é a rede
-  que está "invisível", é a placa que nunca olha pro canal dela.
+  diferentes. A placa ficava "presa" num único canal (o último usado numa
+  captura anterior) e nunca visitava os outros.
 
-**O que ainda funciona bem nessa placa:** detecção de WPS e de cliente
-conectado quando a rede está no canal em que a placa ficou presa, e
-**captura passiva de handshake** nesse mesmo canal (esperar alguém
-conectar/reconectar naturalmente, sem depender de deauth).
+  **✅ Corrigido automaticamente no script**, e não é mais uma limitação
+  permanente: recarregar o módulo do driver (`rmmod`/`modprobe mt7921e`)
+  limpa esse estado preso. O script agora faz isso sozinho em
+  `entrar_modo_monitor()` (função `_recarregar_driver_se_necessario`, só
+  para drivers `mt76`/`mt7921`/`mt7915`/`mt7996`) logo depois de matar
+  NetworkManager/wpa_supplicant. Confirmado na prática: depois do reload, um
+  scan de 2s achou 51 redes em canais de 1 a 157, cobrindo 2.4 e 5 GHz de
+  verdade — antes disso, minutos de scan só achavam redes no canal 36.
+
+**O que ainda funciona bem nessa placa:** detecção de WPS, detecção de
+cliente conectado, scan completo (com o reload automático acima), e
+**captura passiva de handshake** (esperar alguém conectar/reconectar
+naturalmente, sem depender de deauth).
 
 **Solução real:** usar um adaptador WiFi **USB externo** com chipset
 conhecido por injeção/monitor confiável no Linux, em vez da placa interna:
