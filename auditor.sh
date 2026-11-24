@@ -956,6 +956,32 @@ capturar_handshake() {
         ((tentativas++))
     done
 
+    # Encerra o airodump-ng ANTES de fazer a checagem final de handshake. O
+    # arquivo .cap é escrito com buffer interno do airodump — mesmo com
+    # "--write-interval 1", o handshake pode já ter chegado fisicamente mas só
+    # ficar visível no arquivo em disco depois que o processo é encerrado de
+    # verdade (confirmado na prática: a checagem em loop deu "não encontrado"
+    # pro mesmo arquivo que, rodado manualmente DEPOIS do processo morrer,
+    # mostrava "WPA (1 handshake)" — ou seja, um handshake real estava sendo
+    # perdido só por causa da ordem de checagem).
+    kill "$airodump_pid" &>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        kill -0 "$airodump_pid" &>/dev/null || break
+        sleep 1
+    done
+    kill -9 "$airodump_pid" &>/dev/null || true
+    wait "$airodump_pid" 2>/dev/null || true
+
+    if [[ $handshake_ok -eq 0 ]]; then
+        local capfile
+        capfile="$(ls -t "${CAPTURE_PREFIX}"*.cap 2>/dev/null | head -1)"
+        if [[ -n "$capfile" ]] && aircrack-ng -b "${TARGET_BSSID}" "$capfile" 2>/dev/null \
+            | grep -Eqi "[1-9][0-9]* handshakes?"; then
+            handshake_ok=1
+            HANDSHAKE_CAP="$capfile"
+        fi
+    fi
+
     if [[ $handshake_ok -eq 0 ]]; then
         echo
         if ha_cliente_conectado; then
@@ -968,25 +994,7 @@ capturar_handshake() {
             echo ">>> certos) enquanto a captura estava rodando, e tente conectar agora."
         fi
         pausar_enter
-
-        local capfile
-        capfile="$(ls -t "${CAPTURE_PREFIX}"*.cap 2>/dev/null | head -1)"
-        if [[ -n "$capfile" ]] && aircrack-ng -b "${TARGET_BSSID}" "$capfile" 2>/dev/null \
-            | grep -Eqi "[1-9][0-9]* handshakes?"; then
-            handshake_ok=1
-            HANDSHAKE_CAP="$capfile"
-        fi
     fi
-
-    # Encerra o airodump-ng em background com prazo: TERM, espera até 5s,
-    # e força KILL se ele não morrer sozinho (evita travar pra sempre no "wait").
-    kill "$airodump_pid" &>/dev/null || true
-    for _ in 1 2 3 4 5; do
-        kill -0 "$airodump_pid" &>/dev/null || break
-        sleep 1
-    done
-    kill -9 "$airodump_pid" &>/dev/null || true
-    wait "$airodump_pid" 2>/dev/null || true
 
     if [[ $handshake_ok -eq 1 ]]; then
         log "Handshake capturado com sucesso."
