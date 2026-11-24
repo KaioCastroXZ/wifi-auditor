@@ -980,6 +980,27 @@ capturar_handshake() {
             handshake_ok=1
             HANDSHAKE_CAP="$capfile"
         fi
+
+        # Fallback com hcxpcapngtool: confirmado na prática que o aircrack-ng
+        # pode dizer "sem handshake" num .cap que na verdade TEM um par EAPOL
+        # válido — acontece em capturas sem cabeçalho radiotap (limitação do
+        # driver mt76) e/ou com muitos frames de deauth no meio (nosso próprio
+        # deauth repetido). O hcxpcapngtool usa validação mais tolerante
+        # (confere replay counter) e às vezes salva um par que o aircrack-ng
+        # simplesmente não reconhece.
+        if [[ $handshake_ok -eq 0 && -n "$capfile" ]] && command -v hcxpcapngtool &>/dev/null; then
+            local hc_tmp="${WORKDIR}/handshake_check.hc22000"
+            rm -f "$hc_tmp"
+            local pares
+            pares="$(hcxpcapngtool -o "$hc_tmp" "$capfile" 2>&1 \
+                | grep -oE 'EAPOL pairs written to 22000 hash file\.*: [0-9]+' \
+                | grep -oE '[0-9]+$')"
+            if [[ -n "$pares" && "$pares" -gt 0 ]]; then
+                handshake_ok=1
+                HANDSHAKE_CAP="$capfile"
+                log "Handshake confirmado via hcxpcapngtool (aircrack-ng não reconheceu, mas havia ${pares} par(es) EAPOL válido(s))."
+            fi
+        fi
     fi
 
     if [[ $handshake_ok -eq 0 ]]; then
