@@ -7,6 +7,15 @@
 respostas.txt
 auditoria*.log
 
+# hashes e saídas do hashcat/aircrack — podem conter a senha real em texto
+*.hc22000
+*.pcapng
+*hashcat*.out
+*hashcat*found.txt
+*handshake_check*
+*pmkid_found.txt
+*pmkid*.pcapng
+
 # wordlist baixada em tempo de execução (grande, não precisa ir pro repo)
 wordlists/
 
