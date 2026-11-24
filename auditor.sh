@@ -1412,8 +1412,20 @@ rota_pmkid() {
     # nunca vai funcionar aqui mesmo, pular ela de propósito PROTEGE as
     # rotas seguintes de serem quebradas à toa por uma tentativa fadada ao
     # fracasso.
+    # Detecção com 3 fallbacks: o caminho via $IFACE pode falhar se a interface
+    # estiver num instante de transição entre as rotas anteriores (visto na
+    # prática: voltou vazio numa run real e deixou a Rota PMKID rodar sem
+    # querer). MONIFACE e lsmod cobrem esse caso.
     local drv=""
-    drv="$(basename "$(readlink -f "/sys/class/net/${IFACE}/device/driver" 2>/dev/null)" 2>/dev/null)"
+    if [[ -n "${IFACE:-}" ]]; then
+        drv="$(basename "$(readlink -f "/sys/class/net/${IFACE}/device/driver" 2>/dev/null)" 2>/dev/null)"
+    fi
+    if [[ -z "$drv" && -n "${MONIFACE:-}" ]]; then
+        drv="$(basename "$(readlink -f "/sys/class/net/${MONIFACE}/device/driver" 2>/dev/null)" 2>/dev/null)"
+    fi
+    if [[ -z "$drv" ]]; then
+        drv="$(lsmod | awk '$1 ~ /^mt76/{print $1; exit}')"
+    fi
     if [[ "$drv" =~ ^(mt76|mt7921|mt7915|mt7996) ]]; then
         log "Driver ${drv} (MediaTek mt76) — PMKID é conhecido por não funcionar nessa"
         log "família de driver (hcxdumptool falha ao 'armar' a interface) e tentar mesmo"
